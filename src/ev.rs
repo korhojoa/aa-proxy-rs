@@ -193,6 +193,29 @@ pub async fn send_input_key(
     Ok(())
 }
 
+/// Send a ByeByeRequest on the control channel (channel 0) to the phone,
+/// requesting a clean AA session teardown with reason USER_SELECTION.
+pub async fn send_byebye(tx: Sender<Packet>) -> Result<()> {
+    let mut msg = ByeByeRequest::new();
+    msg.set_reason(ByeByeReason::USER_SELECTION);
+
+    let mut payload: Vec<u8> = msg.write_to_bytes()?;
+    // prepend 2-byte message_id for MESSAGE_BYEBYE_REQUEST (= 15 = 0x000F)
+    let msg_id = ControlMessageType::MESSAGE_BYEBYE_REQUEST as u16;
+    payload.insert(0, (msg_id >> 8) as u8);
+    payload.insert(1, (msg_id & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: 0,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!("Sending ByeByeRequest (USER_SELECTION) to phone...");
+    Ok(())
+}
+
 pub async fn spawn_ev_client_task() -> (
     tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::Sender<EvTaskCommand>,
