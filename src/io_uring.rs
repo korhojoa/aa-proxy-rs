@@ -363,6 +363,7 @@ pub async fn io_loop(
     tx: Arc<Mutex<Option<Sender<Packet>>>>,
     sensor_channel: Arc<Mutex<Option<u8>>>,
     input_channel: Arc<Mutex<Option<u8>>>,
+    session_started: Arc<Notify>,
 ) -> Result<()> {
     let shared_config = config.clone();
     #[allow(unused_variables)]
@@ -609,6 +610,9 @@ pub async fn io_loop(
         ));
 
         // Thread for monitoring transfer
+            session_started.notify_one();
+
+            // Thread for monitoring transfer
         let mut monitor = tokio::spawn(transfer_monitor(
             stats_interval,
             file_bytes,
