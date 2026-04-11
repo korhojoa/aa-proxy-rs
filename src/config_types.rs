@@ -1,4 +1,5 @@
 use crate::mitm;
+use crate::mitm::protos::DisplayType;
 use crate::mitm::protos::EvConnectorType;
 use bluer::Address;
 use serde::{
@@ -79,12 +80,41 @@ impl Default for BluetoothAddressList {
     }
 }
 
+fn parse_display_type_token(token: &str) -> Option<DisplayType> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "main" | "display_type_main" => Some(DisplayType::DISPLAY_TYPE_MAIN),
+        "cluster" | "display_type_cluster" => Some(DisplayType::DISPLAY_TYPE_CLUSTER),
+        "aux" | "auxiliary" | "display_type_auxiliary" => {
+            Some(DisplayType::DISPLAY_TYPE_AUXILIARY)
+        }
+        _ => None,
+    }
+}
+
 impl std::str::FromStr for EvConnectorType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         <mitm::protos::EvConnectorType as protobuf::Enum>::from_str(s.trim())
             .ok_or_else(|| format!("Unknown EV connector type: {}", s))
+    }
+}
+
+impl std::str::FromStr for DisplayType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_display_type_token(s)
+            .or_else(|| {
+                <mitm::protos::DisplayType as protobuf::Enum>::from_str(s.trim())
+            })
+            .ok_or_else(|| format!("Unknown display type: {}", s))
+    }
+}
+
+impl fmt::Display for DisplayType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
     }
 }
 
@@ -154,6 +184,68 @@ impl fmt::Display for EvConnectorTypes {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct InjectDisplayTypes(pub Option<Vec<DisplayType>>);
+
+impl InjectDisplayTypes {
+    fn to_string_internal(&self) -> String {
+        match &self.0 {
+            Some(types) => types
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<String>>()
+                .join(","),
+            None => "".to_string(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InjectDisplayTypes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let mut types = Vec::new();
+        if !s.is_empty() {
+            for part in s.split(',') {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    let display_type = trimmed
+                        .parse::<DisplayType>()
+                        .map_err(de::Error::custom)?;
+                    if !types.contains(&display_type) {
+                        types.push(display_type);
+                    }
+                }
+            }
+        }
+
+        if types.is_empty() {
+            Ok(InjectDisplayTypes(None))
+        } else {
+            Ok(InjectDisplayTypes(Some(types)))
+        }
+    }
+}
+
+impl Serialize for InjectDisplayTypes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s = self.to_string_internal();
+        serializer.serialize_str(&s)
+    }
+}
+
+impl fmt::Display for InjectDisplayTypes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.to_string_internal();
+        write!(f, "{}", s)
+    }
+}
+
 #[derive(
     clap::ValueEnum, Default, Debug, PartialEq, PartialOrd, Clone, Copy, Deserialize, Serialize,
 )]
@@ -216,5 +308,38 @@ impl<'de> Deserialize<'de> for UsbId {
         }
 
         deserializer.deserialize_str(UsbIdVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_display_types_parses_aliases_and_deduplicates() {
+        let parsed: InjectDisplayTypes = serde_json::from_str("\"cluster,aux,cluster\"")
+            .expect("valid inject display type list");
+
+        assert_eq!(
+            parsed,
+            InjectDisplayTypes(Some(vec![
+                DisplayType::DISPLAY_TYPE_CLUSTER,
+                DisplayType::DISPLAY_TYPE_AUXILIARY,
+            ]))
+        );
+    }
+
+    #[test]
+    fn inject_display_types_serializes_to_enum_names() {
+        let value = InjectDisplayTypes(Some(vec![
+            DisplayType::DISPLAY_TYPE_CLUSTER,
+            DisplayType::DISPLAY_TYPE_AUXILIARY,
+        ]));
+
+        let serialized = serde_json::to_string(&value).expect("serialize inject display types");
+        assert_eq!(
+            serialized,
+            "\"DISPLAY_TYPE_CLUSTER,DISPLAY_TYPE_AUXILIARY\""
+        );
     }
 }

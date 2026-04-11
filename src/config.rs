@@ -1,4 +1,6 @@
-use crate::config_types::{BluetoothAddressList, EvConnectorTypes, HexdumpLevel, UsbId};
+use crate::config_types::{
+    BluetoothAddressList, EvConnectorTypes, HexdumpLevel, InjectDisplayTypes, UsbId,
+};
 use indexmap::IndexMap;
 use serde::de::{Deserializer, Error as DeError};
 use serde::{Deserialize, Serialize};
@@ -116,6 +118,22 @@ pub struct AppConfig {
     pub ev: bool,
     pub remove_bluetooth: bool,
     pub remove_wifi: bool,
+    pub inject_display_types: InjectDisplayTypes,
+    pub inject_add_input_sources: bool,
+    pub inject_cluster_display_id: u16,
+    pub inject_cluster_width_margin: u16,
+    pub inject_cluster_height_margin: u16,
+    pub inject_cluster_density: u16,
+    pub inject_cluster_viewing_distance: u16,
+    pub inject_cluster_touch_width: u16,
+    pub inject_cluster_touch_height: u16,
+    pub inject_aux_display_id: u16,
+    pub inject_aux_width_margin: u16,
+    pub inject_aux_height_margin: u16,
+    pub inject_aux_density: u16,
+    pub inject_aux_viewing_distance: u16,
+    pub inject_aux_touch_width: u16,
+    pub inject_aux_touch_height: u16,
     pub change_usb_order: bool,
     pub stop_on_disconnect: bool,
     pub waze_lht_workaround: bool,
@@ -262,6 +280,22 @@ impl Default for AppConfig {
             ev: false,
             remove_bluetooth: false,
             remove_wifi: false,
+            inject_display_types: InjectDisplayTypes::default(),
+            inject_add_input_sources: false,
+            inject_cluster_display_id: 1,
+            inject_cluster_width_margin: 270,
+            inject_cluster_height_margin: 344,
+            inject_cluster_density: 180,
+            inject_cluster_viewing_distance: 100,
+            inject_cluster_touch_width: 1280,
+            inject_cluster_touch_height: 720,
+            inject_aux_display_id: 2,
+            inject_aux_width_margin: 0,
+            inject_aux_height_margin: 0,
+            inject_aux_density: 160,
+            inject_aux_viewing_distance: 300,
+            inject_aux_touch_width: 1280,
+            inject_aux_touch_height: 720,
             change_usb_order: false,
             stop_on_disconnect: false,
             waze_lht_workaround: false,
@@ -364,6 +398,24 @@ impl AppConfig {
         doc["ev"] = value(self.ev);
         doc["remove_bluetooth"] = value(self.remove_bluetooth);
         doc["remove_wifi"] = value(self.remove_wifi);
+        doc["inject_display_types"] = value(self.inject_display_types.to_string());
+        doc["inject_add_input_sources"] = value(self.inject_add_input_sources);
+        doc["inject_cluster_display_id"] = value(self.inject_cluster_display_id as i64);
+        doc["inject_cluster_width_margin"] = value(self.inject_cluster_width_margin as i64);
+        doc["inject_cluster_height_margin"] =
+            value(self.inject_cluster_height_margin as i64);
+        doc["inject_cluster_density"] = value(self.inject_cluster_density as i64);
+        doc["inject_cluster_viewing_distance"] =
+            value(self.inject_cluster_viewing_distance as i64);
+        doc["inject_cluster_touch_width"] = value(self.inject_cluster_touch_width as i64);
+        doc["inject_cluster_touch_height"] = value(self.inject_cluster_touch_height as i64);
+        doc["inject_aux_display_id"] = value(self.inject_aux_display_id as i64);
+        doc["inject_aux_width_margin"] = value(self.inject_aux_width_margin as i64);
+        doc["inject_aux_height_margin"] = value(self.inject_aux_height_margin as i64);
+        doc["inject_aux_density"] = value(self.inject_aux_density as i64);
+        doc["inject_aux_viewing_distance"] = value(self.inject_aux_viewing_distance as i64);
+        doc["inject_aux_touch_width"] = value(self.inject_aux_touch_width as i64);
+        doc["inject_aux_touch_height"] = value(self.inject_aux_touch_height as i64);
         doc["change_usb_order"] = value(self.change_usb_order);
         doc["stop_on_disconnect"] = value(self.stop_on_disconnect);
         doc["waze_lht_workaround"] = value(self.waze_lht_workaround);

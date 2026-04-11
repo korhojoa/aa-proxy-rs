@@ -12,12 +12,14 @@ use tokio::time::{sleep, Duration};
 // protobuf stuff:
 include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
 use crate::ev::protos::*;
+use crate::ev::InputMessageId::INPUT_MESSAGE_INPUT_REPORT;
 use crate::ev::SensorMessageId::*;
 use crate::mitm::Packet;
 use crate::mitm::{ENCRYPTED, FRAME_TYPE_FIRST, FRAME_TYPE_LAST};
 use protobuf::Message;
 
 use serde::Deserialize;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub static FORD_EV_MODEL: &[u8] = include_bytes!("protos/ford_ev_model.bin");
 pub const EV_MODEL_FILE: &str = "/etc/aa-proxy-rs/ev_model.bin";
@@ -117,6 +119,76 @@ pub async fn send_ev_data(tx: Sender<Packet>, sensor_ch: u8, batt: BatteryData) 
     };
     tx.send(pkt).await?;
     info!("{} injecting ENERGY_MODEL_DATA packet...", NAME);
+
+    Ok(())
+}
+
+/// Inject toll card presence data via sensor batch.
+pub async fn send_toll_card(tx: Sender<Packet>, sensor_ch: u8, is_card_present: bool) -> Result<()> {
+    let mut msg = SensorBatch::new();
+    let mut toll = TollCardData::new();
+    toll.set_is_card_present(is_card_present);
+    msg.toll_card_data.push(toll);
+
+    // creating back binary data for sending
+    let mut payload: Vec<u8> = msg.write_to_bytes()?;
+    // add SENSOR header
+    payload.insert(0, ((SENSOR_MESSAGE_BATCH as u16) >> 8) as u8);
+    payload.insert(1, ((SENSOR_MESSAGE_BATCH as u16) & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: sensor_ch,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!(
+        "{} injecting TOLL_CARD_DATA packet (is_card_present={})...",
+        NAME, is_card_present
+    );
+
+    Ok(())
+}
+
+/// Inject a key input event on AA input channel.
+pub async fn send_input_key(
+    tx: Sender<Packet>,
+    input_ch: u8,
+    keycode: u32,
+    down: bool,
+    longpress: bool,
+) -> Result<()> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+
+    let mut key = key_event::Key::new();
+    key.set_keycode(keycode);
+    key.set_down(down);
+    key.set_metastate(0);
+    key.set_longpress(longpress);
+
+    let mut key_event = KeyEvent::new();
+    key_event.keys.push(key);
+
+    let mut input = InputReport::new();
+    input.set_timestamp(ts);
+    input.key_event = Some(key_event).into();
+
+    let mut payload: Vec<u8> = input.write_to_bytes()?;
+    payload.insert(0, ((INPUT_MESSAGE_INPUT_REPORT as u16) >> 8) as u8);
+    payload.insert(1, ((INPUT_MESSAGE_INPUT_REPORT as u16) & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: input_ch,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!(
+        "{} injecting INPUT_REPORT key packet (keycode={}, down={}, longpress={})...",
+        NAME, keycode, down, longpress
+    );
 
     Ok(())
 }

@@ -45,6 +45,48 @@
       .grid-cols-2 {
         grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
       }
+
+      .controller-layout {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: repeat(1, minmax(0, 1fr));
+      }
+
+      .controller-columns {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: repeat(1, minmax(0, 1fr));
+      }
+
+      .keypad-grid {
+        display: grid;
+        gap: 0.375rem;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .dpad-grid {
+        display: grid;
+        gap: 0.375rem;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        align-items: center;
+        justify-items: center;
+      }
+
+      .dpad-center {
+        min-width: 4rem;
+      }
+
+      .wide-grid {
+        display: grid;
+        gap: 0.375rem;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      @media (min-width: 900px) {
+        .controller-columns {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
     </style>
   </head>
   <body>
@@ -69,6 +111,12 @@
           <button type="button" onclick="handleAction('/reboot')">
             🔁 Reboot device
           </button>
+          <button type="button" onclick="handleAction('/toll-card/add')">
+            🃏 Add toll card
+          </button>
+          <button type="button" onclick="handleAction('/toll-card/remove')">
+            🗑️ Remove toll card
+          </button>
           <button type="button" data-endpoint="/upload-certs">
             📤 Upload MITM certs (.tar.gz)
           </button>
@@ -84,6 +132,71 @@
           <button type="button" data-endpoint="/userdata-restore">
             📤 Restore configuration (.tar.gz)
           </button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend class="section-title"><strong>🎮 CONTROLLER INPUT</strong></legend>
+        <div class="section-body controller-layout">
+          <div class="controller-columns">
+            <div>
+              <p><strong>Phone Keypad</strong></p>
+              <div class="keypad-grid">
+                <button type="button" onclick="sendKeyTap(8, '1')">1</button>
+                <button type="button" onclick="sendKeyTap(9, '2')">2</button>
+                <button type="button" onclick="sendKeyTap(10, '3')">3</button>
+                <button type="button" onclick="sendKeyTap(11, '4')">4</button>
+                <button type="button" onclick="sendKeyTap(12, '5')">5</button>
+                <button type="button" onclick="sendKeyTap(13, '6')">6</button>
+                <button type="button" onclick="sendKeyTap(14, '7')">7</button>
+                <button type="button" onclick="sendKeyTap(15, '8')">8</button>
+                <button type="button" onclick="sendKeyTap(16, '9')">9</button>
+                <button type="button" onclick="sendKeyTap(17, '*')">*</button>
+                <button type="button" onclick="sendKeyTap(7, '0')">0</button>
+                <button type="button" onclick="sendKeyTap(18, '#')">#</button>
+              </div>
+            </div>
+
+            <div>
+              <p><strong>D-Pad</strong></p>
+              <div class="dpad-grid">
+                <span></span>
+                <button type="button" onclick="sendKeyTap(19, 'DPAD_UP')">▲</button>
+                <span></span>
+                <button type="button" onclick="sendKeyTap(21, 'DPAD_LEFT')">◀</button>
+                <button
+                  type="button"
+                  class="dpad-center"
+                  onclick="sendKeyTap(23, 'DPAD_CENTER')"
+                >
+                  ●
+                </button>
+                <button type="button" onclick="sendKeyTap(22, 'DPAD_RIGHT')">▶</button>
+                <span></span>
+                <button type="button" onclick="sendKeyTap(20, 'DPAD_DOWN')">▼</button>
+                <span></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="wide-grid">
+            <button type="button" onclick="sendKeyTap(5, 'CALL')">📞 Call</button>
+            <button type="button" onclick="sendKeyTap(6, 'ENDCALL')">📴 End Call</button>
+            <button type="button" onclick="sendKeyTap(85, 'MEDIA_PLAY_PAUSE')">
+              ⏯ Play/Pause
+            </button>
+            <button type="button" onclick="sendKeyTap(127, 'MEDIA_PAUSE')">⏸ Pause</button>
+            <button type="button" onclick="sendKeyTap(126, 'MEDIA_PLAY')">▶ Play</button>
+            <button type="button" onclick="sendKeyTap(86, 'MEDIA_STOP')">⏹ Stop</button>
+            <button type="button" onclick="sendKeyTap(88, 'MEDIA_PREVIOUS')">⏮ Previous</button>
+            <button type="button" onclick="sendKeyTap(87, 'MEDIA_NEXT')">⏭ Next</button>
+            <button type="button" onclick="sendKeyTap(24, 'VOLUME_UP')">🔊 Volume +</button>
+            <button type="button" onclick="sendKeyTap(25, 'VOLUME_DOWN')">🔉 Volume -</button>
+            <button type="button" onclick="sendKeyTap(164, 'MUTE')">🔇 Mute</button>
+            <button type="button" onclick="sendKeyTap(4, 'BACK')">↩ Back</button>
+            <button type="button" onclick="sendKeyTap(3, 'HOME')">🏠 Home</button>
+            <button type="button" onclick="sendKeyTap(84, 'SEARCH')">🔎 Search</button>
+          </div>
         </div>
       </fieldset>
     </template>
@@ -252,6 +365,24 @@
           if (document.getElementById(key)) {
             setValue(key, data[key]);
           }
+        }
+      }
+
+      async function sendKeyTap(keycode, label) {
+        try {
+          const response = await fetch("/input/key", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ keycode }),
+          });
+
+          if (!response.ok) {
+            const body = await response.text();
+            throw new Error(`${response.status}: ${body}`);
+          }
+        } catch (error) {
+          console.error(`Failed to send key '${label}' (${keycode}):`, error);
+          alert(`❌ Failed to send key '${label}' (${keycode}).`);
         }
       }
 

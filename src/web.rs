@@ -3,6 +3,8 @@ use crate::config::AppConfig;
 use crate::config::ConfigJson;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
+use crate::ev::send_input_key;
+use crate::ev::send_toll_card;
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
@@ -23,6 +25,7 @@ use futures::StreamExt;
 use glob::glob;
 use hyper::body::to_bytes;
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use simplelog::*;
@@ -59,6 +62,7 @@ pub struct AppState {
     pub config_file: Arc<PathBuf>,
     pub tx: Arc<Mutex<Option<Sender<Packet>>>>,
     pub sensor_channel: Arc<Mutex<Option<u8>>>,
+    pub input_channel: Arc<Mutex<Option<u8>>>,
 }
 
 pub fn app(state: Arc<AppState>) -> Router {
@@ -73,6 +77,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/upload-certs", post(upload_cert_bundle_handler))
         .route("/certs-info", get(certs_info_handler))
         .route("/battery", post(battery_handler))
+        .route("/toll-card/add", post(toll_card_add_handler))
+        .route("/toll-card/remove", post(toll_card_remove_handler))
+        .route("/input/key", post(input_key_handler))
         .route("/userdata-backup", get(userdata_backup_handler))
         .route("/userdata-restore", post(userdata_restore_handler))
         .route("/factory-reset", post(factory_reset_handler))
@@ -249,6 +256,74 @@ pub async fn battery_handler(
         }
     } else {
         warn!("{} Not sending packet because no sensor channel yet", NAME);
+    }
+
+    (StatusCode::OK, "OK").into_response()
+}
+
+async fn send_toll_card_from_web(state: Arc<AppState>, is_card_present: bool) -> impl IntoResponse {
+    if let Some(ch) = *state.sensor_channel.lock().await {
+        if let Some(tx) = state.tx.lock().await.clone() {
+            if let Err(e) = send_toll_card(tx.clone(), ch, is_card_present).await {
+                error!("{} Toll card send error: {}", NAME, e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send toll card data")
+                    .into_response();
+            }
+            return (StatusCode::OK, "OK").into_response();
+        }
+        warn!("{} Not sending toll card packet because tx is unavailable", NAME);
+        return (StatusCode::SERVICE_UNAVAILABLE, "No active session tx").into_response();
+    }
+
+    warn!("{} Not sending toll card packet because no sensor channel yet", NAME);
+    (StatusCode::SERVICE_UNAVAILABLE, "No sensor channel yet").into_response()
+}
+
+pub async fn toll_card_add_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    send_toll_card_from_web(state, true).await
+}
+
+pub async fn toll_card_remove_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    send_toll_card_from_web(state, false).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InputKeyRequest {
+    pub keycode: u32,
+    pub down: Option<bool>,
+    pub longpress: Option<bool>,
+}
+
+pub async fn input_key_handler(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<InputKeyRequest>,
+) -> impl IntoResponse {
+    let Some(input_ch) = *state.input_channel.lock().await else {
+        warn!("{} Not sending key packet because no input channel yet", NAME);
+        return (StatusCode::SERVICE_UNAVAILABLE, "No input channel yet").into_response();
+    };
+
+    let Some(tx) = state.tx.lock().await.clone() else {
+        warn!("{} Not sending key packet because tx is unavailable", NAME);
+        return (StatusCode::SERVICE_UNAVAILABLE, "No active session tx").into_response();
+    };
+
+    let down = data.down.unwrap_or(true);
+    let longpress = data.longpress.unwrap_or(false);
+
+    if data.down.is_none() {
+        // Default behavior is a tap: press and release.
+        if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, true, longpress).await {
+            error!("{} Input key send (down) error: {}", NAME, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send key event").into_response();
+        }
+        if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, false, longpress).await {
+            error!("{} Input key send (up) error: {}", NAME, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send key event").into_response();
+        }
+    } else if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, down, longpress).await {
+        error!("{} Input key send error: {}", NAME, e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send key event").into_response();
     }
 
     (StatusCode::OK, "OK").into_response()

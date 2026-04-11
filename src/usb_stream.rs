@@ -49,6 +49,7 @@ pub struct UsbStreamRead {
 }
 pub struct UsbStreamWrite {
     pub write_queue: Endpoint<Bulk, Out>,
+    write_in_flight_len: Option<usize>,
 }
 
 // switch a USB device to accessory mode
@@ -188,7 +189,10 @@ impl UsbStreamRead {
 
 impl UsbStreamWrite {
     pub fn new(write_queue: Endpoint<Bulk, Out>) -> Self {
-        UsbStreamWrite { write_queue }
+        UsbStreamWrite {
+            write_queue,
+            write_in_flight_len: None,
+        }
     }
 }
 
@@ -259,23 +263,36 @@ impl AsyncRead for UsbStreamRead {
 impl AsyncWrite for UsbStreamWrite {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let pin = self.get_mut();
 
-        // extend to local buffer
-        pin.write_queue.submit(buf.to_vec().into());
-        use futures::executor::block_on;
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
 
-        if pin.write_queue.pending() > 0 {
-            let res = block_on(pin.write_queue.next_complete());
-            match res.status {
-                Ok(_) => Poll::Ready(Ok(0 /*res.data.actual_length()*/)),
-                Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+        // Submit at most one write per poll_write call cycle and then poll for completion.
+        if pin.write_in_flight_len.is_none() {
+            pin.write_queue.submit(buf.to_vec().into());
+            pin.write_in_flight_len = Some(buf.len());
+        }
+
+        if pin.write_queue.pending() == 0 {
+            let written = pin.write_in_flight_len.take().unwrap_or(0);
+            return Poll::Ready(Ok(written));
+        }
+
+        let res = ready!(pin.write_queue.poll_next_complete(cx));
+        match res.status {
+            Ok(_) => {
+                let written = pin.write_in_flight_len.take().unwrap_or(buf.len());
+                Poll::Ready(Ok(written))
             }
-        } else {
-            Poll::Ready(Ok(0))
+            Err(e) => {
+                pin.write_in_flight_len = None;
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+            }
         }
     }
 

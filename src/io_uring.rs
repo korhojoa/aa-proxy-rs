@@ -40,6 +40,8 @@ const USB_ACCESSORY_PATH: &str = "/dev/usb_accessory";
 pub const BUFFER_LEN: usize = 16 * 1024;
 const TCP_CLIENT_TIMEOUT: Duration = Duration::new(30, 0);
 const COMP_APP_TCP_PORT: u16 = 9999;
+// Original queue depth was 10. Keep this small to avoid queue-induced latency.
+const MITM_QUEUE_CAPACITY: usize = 10;
 
 use crate::config::{Action, SharedConfig};
 use crate::config::{TCP_DHU_PORT, TCP_SERVER_PORT};
@@ -108,6 +110,7 @@ async fn transfer_monitor(
     let mut stall_tcp_bytes_last: usize = 0;
     let mut report_time = Instant::now();
     let mut stall_check = Instant::now();
+    let mut consecutive_dual_stall_checks: u8 = 0;
 
     info!(
         "{} ⚙️ Showing transfer statistics: <b><blue>{}</>",
@@ -166,8 +169,22 @@ async fn transfer_monitor(
             stall_usb_bytes_last = usb_bytes_out - stall_usb_bytes_last;
             stall_tcp_bytes_last = tcp_bytes_out - stall_tcp_bytes_last;
 
-            if stall_usb_bytes_last == 0 || stall_tcp_bytes_last == 0 {
-                return Err("unexpected transfer stall".into());
+            // Treat only full-duplex silence as a stall signal. In practice one
+            // direction may be briefly idle during startup or asymmetric traffic.
+            if stall_usb_bytes_last == 0 && stall_tcp_bytes_last == 0 {
+                consecutive_dual_stall_checks = consecutive_dual_stall_checks.saturating_add(1);
+                warn!(
+                    "{} transfer monitor: no traffic in both directions for {} (check #{})",
+                    NAME,
+                    format_duration(read_timeout),
+                    consecutive_dual_stall_checks,
+                );
+
+                if consecutive_dual_stall_checks >= 2 {
+                    return Err("unexpected transfer stall".into());
+                }
+            } else {
+                consecutive_dual_stall_checks = 0;
             }
 
             // save values for next iteration
@@ -204,14 +221,38 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
             "{} tcp_bridge: before connect, local={} remote={}",
             NAME, local_addr, remote_addr
         );
-        match TokioTcpStream::connect(remote_addr).await {
-            Ok(mut remote) => {
+        match timeout(Duration::from_secs(3), TokioTcpStream::connect(remote_addr)).await {
+            Err(_) => {
+                warn!(
+                    "{} tcp_bridge: timeout connecting to remote server {}",
+                    NAME, remote_addr
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "{} tcp_bridge: failed to connect to remote server {}: {}",
+                    NAME, remote_addr, e
+                );
+            }
+            Ok(Ok(mut remote)) => {
                 debug!(
                     "{} tcp_bridge: remote side connected: ({})",
                     NAME, remote_addr
                 );
-                match TokioTcpStream::connect(local_addr).await {
-                    Ok(mut local) => {
+                match timeout(Duration::from_secs(3), TokioTcpStream::connect(local_addr)).await {
+                    Err(_) => {
+                        warn!(
+                            "{} tcp_bridge: timeout connecting to local server {}",
+                            NAME, local_addr
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "{} tcp_bridge: failed to connect to local server {}: {}",
+                            NAME, local_addr, e
+                        );
+                    }
+                    Ok(Ok(mut local)) => {
                         debug!(
                             "{} tcp_bridge: local side connected: ({})",
                             NAME, local_addr
@@ -229,19 +270,7 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!(
-                            "{} tcp_bridge: Failed to connect to local server {}: {}",
-                            NAME, local_addr, e
-                        );
-                    }
                 }
-            }
-            Err(e) => {
-                debug!(
-                    "{} tcp_bridge: Failed to connect to remote server {}: {}",
-                    NAME, remote_addr, e
-                );
             }
         }
 
@@ -296,20 +325,29 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
 
     // this is creating a reverse tcp bridge for Android
     // direct connection to the device side is not allowed
-    tokio::spawn(async move {
-        info!(
-            "{} starting TCP reverse connection, Android IP: {}",
+    // Note: this is only meaningful for MD/phone connections, not DHU emulator clients.
+    if !addr.ip().is_loopback() {
+        tokio::spawn(async move {
+            info!(
+                "{} starting TCP reverse connection, Android IP: {}",
+                NAME,
+                addr.ip()
+            );
+            // FIXME use port configured by user for webserver
+            // or ignore when webserver disabled...
+            tcp_bridge(
+                &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
+                "127.0.0.1:80",
+            )
+            .await;
+        });
+    } else {
+        debug!(
+            "{} skipping reverse tcp_bridge for localhost client ({})",
             NAME,
-            addr.ip()
+            addr
         );
-        // FIXME use port configured by user for webserver
-        // or ignore when webserver disabled...
-        tcp_bridge(
-            &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
-            "127.0.0.1:80",
-        )
-        .await;
-    });
+    }
 
     // disable Nagle algorithm, so segments are always sent as soon as possible,
     // even if there is only a small amount of data
@@ -324,6 +362,7 @@ pub async fn io_loop(
     config: SharedConfig,
     tx: Arc<Mutex<Option<Sender<Packet>>>>,
     sensor_channel: Arc<Mutex<Option<u8>>>,
+    input_channel: Arc<Mutex<Option<u8>>>,
 ) -> Result<()> {
     let shared_config = config.clone();
     #[allow(unused_variables)]
@@ -484,10 +523,16 @@ pub async fn io_loop(
         let mut hu_tcp_stream = None;
 
         // MITM/proxy mpsc channels:
-        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (txr_hu, rxr_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (txr_md, rxr_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
+        // Keep enough in-flight capacity so reader tasks do not stall under bursty
+        // media traffic and starve control-channel forwarding.
+        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (txr_hu, rxr_md): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (txr_md, rxr_hu): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
 
         // selecting I/O device for reading and writing
         // and creating desired objects for proxy functions
@@ -545,6 +590,7 @@ pub async fn io_loop(
             rxr_md,
             shared_config.clone(),
             sensor_channel.clone(),
+            input_channel.clone(),
             ev_tx.clone(),
             HashMap::new(),
         ));
@@ -557,6 +603,7 @@ pub async fn io_loop(
             rxr_hu,
             shared_config.clone(),
             sensor_channel.clone(),
+            input_channel.clone(),
             ev_tx.clone(),
             persistent_media_sinks.clone(),
         ));
@@ -620,6 +667,8 @@ pub async fn io_loop(
         *tx_lock = None;
         let mut sc_lock = sensor_channel.lock().await;
         *sc_lock = None;
+        let mut ic_lock = input_channel.lock().await;
+        *ic_lock = None;
         // stop EV battery logger if neded
         if config.ev_battery_logger.is_some() {
             ev_tx.send(EvTaskCommand::Stop).await?;

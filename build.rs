@@ -3,12 +3,26 @@ use std::io;
 use std::io::Write;
 use std::process::Command;
 
+fn short_git_date() -> Option<String> {
+    let output = Command::new("git")
+        .args(["log", "-n1", "--pretty=format:%cd", "--date=short", "HEAD"])
+        .output()
+        .ok()?;
+    let date = String::from_utf8(output.stdout).ok()?;
+    let date = date.trim().replace('-', "");
+    if date.is_empty() {
+        None
+    } else {
+        Some(date)
+    }
+}
+
 fn main() {
     // Use write! as a workaround to avoid https://github.com/rust-lang/rust/issues/46016
     // when piping output to an external program
     let mut stdout = io::stdout();
 
-    let mut output = Command::new("git")
+    let output = Command::new("git")
         .args(&["log", "-n1", "--pretty=format:%h", "HEAD"])
         .output()
         .unwrap();
@@ -27,22 +41,19 @@ fn main() {
     }
     _ = write!(&mut stdout, "cargo:rustc-env=GIT_HASH={}\n", result);
 
-    output = Command::new("git")
-        .args(&["log", "-n1", "--pretty=format:%cd", "--date=short", "HEAD"])
-        .output()
-        .unwrap();
-    result = String::from_utf8(output.stdout).unwrap().replace("-", "");
+    result = short_git_date().unwrap_or_default();
     if result.is_empty() {
         result = env::var("AA_PROXY_COMMIT").unwrap_or_default();
         result.truncate(7);
     }
     _ = write!(&mut stdout, "cargo:rustc-env=GIT_DATE={}\n", result);
 
-    output = Command::new("date")
-        .args(&["+%Y%m%d_%H%M%S"])
-        .output()
-        .unwrap();
-    result = String::from_utf8(output.stdout).unwrap();
+    // Keep BUILD_DATE stable across no-op builds so Cargo can reuse artifacts.
+    result = env::var("AA_PROXY_BUILD_DATE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(short_git_date)
+        .unwrap_or_default();
     _ = write!(&mut stdout, "cargo:rustc-env=BUILD_DATE={}\n", result);
 
     // creating protobuf

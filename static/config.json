@@ -191,6 +191,70 @@
           "typ": "boolean",
           "description": "Remove the Wi-Fi service from the `service discovery response`. This option may be helpful for head units with integrated wireless Android Auto."
         },
+        "inject_display_types": {
+          "typ": "string",
+          "description": "Add video display services to the `service discovery response`. Possible values (comma separated): `cluster`, `aux`. Leave empty to disable. Useful when forcing additional display channels for capture. Requires `mitm = true`."
+        },
+        "inject_add_input_sources": {
+          "typ": "boolean",
+          "description": "When enabled, also inject matching `input_source_service` entries for configured display IDs. Disabled by default because HU-specific keycode sets may differ."
+        },
+        "inject_cluster_display_id": {
+          "typ": "integer",
+          "description": "Display ID to use for injected cluster display services."
+        },
+        "inject_cluster_width_margin": {
+          "typ": "integer",
+          "description": "Cluster video width margin for injected display service."
+        },
+        "inject_cluster_height_margin": {
+          "typ": "integer",
+          "description": "Cluster video height margin for injected display service."
+        },
+        "inject_cluster_density": {
+          "typ": "integer",
+          "description": "Cluster display density (DPI) for injected display service."
+        },
+        "inject_cluster_viewing_distance": {
+          "typ": "integer",
+          "description": "Cluster viewing distance for injected display service."
+        },
+        "inject_cluster_touch_width": {
+          "typ": "integer",
+          "description": "Cluster input touchscreen width when `inject_add_input_sources` is enabled."
+        },
+        "inject_cluster_touch_height": {
+          "typ": "integer",
+          "description": "Cluster input touchscreen height when `inject_add_input_sources` is enabled."
+        },
+        "inject_aux_display_id": {
+          "typ": "integer",
+          "description": "Display ID to use for injected auxiliary display services."
+        },
+        "inject_aux_width_margin": {
+          "typ": "integer",
+          "description": "Auxiliary video width margin for injected display service."
+        },
+        "inject_aux_height_margin": {
+          "typ": "integer",
+          "description": "Auxiliary video height margin for injected display service."
+        },
+        "inject_aux_density": {
+          "typ": "integer",
+          "description": "Auxiliary display density (DPI) for injected display service."
+        },
+        "inject_aux_viewing_distance": {
+          "typ": "integer",
+          "description": "Auxiliary viewing distance for injected display service."
+        },
+        "inject_aux_touch_width": {
+          "typ": "integer",
+          "description": "Auxiliary input touchscreen width when `inject_add_input_sources` is enabled."
+        },
+        "inject_aux_touch_height": {
+          "typ": "integer",
+          "description": "Auxiliary input touchscreen height when `inject_add_input_sources` is enabled."
+        },
         "stop_on_disconnect": {
           "typ": "boolean",
           "description": "Stop automatic reconnection after manually selecting `Disconnect` in Android Auto on the phone. aa-proxy will not attempt to reconnect until the next restart or until a Bluetooth connection is initiated manually from the phone."
