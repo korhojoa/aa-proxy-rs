@@ -216,6 +216,60 @@ async fn tokio_main(
         input_channel,
     };
 
+    // Handle process-exit signals with a protocol-clean teardown.
+    let tx_signal = tx.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("{} signal handler init failed (SIGTERM): {}", NAME, e);
+                    return;
+                }
+            };
+            let mut sigquit = match signal(SignalKind::quit()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("{} signal handler init failed (SIGQUIT): {}", NAME, e);
+                    return;
+                }
+            };
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("{} received Ctrl+C/SIGINT, attempting clean disconnect...", NAME);
+                }
+                _ = sigterm.recv() => {
+                    info!("{} received SIGTERM, attempting clean disconnect...", NAME);
+                }
+                _ = sigquit.recv() => {
+                    info!("{} received SIGQUIT, attempting clean disconnect...", NAME);
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                info!("{} received Ctrl+C, attempting clean disconnect...", NAME);
+            }
+        }
+
+        if let Some(sender) = tx_signal.lock().await.clone() {
+            if let Err(e) = send_byebye(sender).await {
+                warn!("{} clean disconnect ByeBye send failed: {}", NAME, e);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        } else {
+            info!("{} no active session while exiting, skipping ByeBye", NAME);
+        }
+
+        std::process::exit(0);
+    });
+
     if session_timeout > 0 {
         let tx_timer = tx.clone();
         tokio::spawn(async move {
