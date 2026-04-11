@@ -190,6 +190,46 @@ async fn action_handler(config: &mut SharedConfig) {
     }
 }
 
+async fn clean_disconnect_and_exit(
+    tx: Arc<Mutex<Option<Sender<Packet>>>>,
+    config: SharedConfig,
+    reason: &str,
+) -> ! {
+    info!("{} {}: initiating clean disconnect", NAME, reason);
+
+    if let Some(sender) = tx.lock().await.clone() {
+        if let Err(e) = send_byebye(sender).await {
+            warn!("{} {}: ByeBye send failed: {}", NAME, reason, e);
+        }
+        // Give the BYEBYE exchange a short head start before forcing reconnect.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    } else {
+        info!("{} {}: no active session tx, skipping ByeBye", NAME, reason);
+    }
+
+    // Trigger normal io_loop teardown (TCP shutdown + USB reset + context cleanup).
+    config.write().await.action_requested = Some(Action::Reconnect);
+
+    // Wait for io_loop cleanup to clear the active tx context, but don't hang forever.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if tx.lock().await.is_none() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                "{} {}: teardown did not complete before deadline, exiting anyway",
+                NAME, reason
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    info!("{} {}: exiting process after teardown", NAME, reason);
+    std::process::exit(0);
+}
+
 async fn tokio_main(
     config: SharedConfig,
     config_json: SharedConfigJson,
@@ -218,6 +258,7 @@ async fn tokio_main(
 
     // Handle process-exit signals with a protocol-clean teardown.
     let tx_signal = tx.clone();
+    let config_signal = config.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -258,31 +299,17 @@ async fn tokio_main(
             }
         }
 
-        if let Some(sender) = tx_signal.lock().await.clone() {
-            if let Err(e) = send_byebye(sender).await {
-                warn!("{} clean disconnect ByeBye send failed: {}", NAME, e);
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        } else {
-            info!("{} no active session while exiting, skipping ByeBye", NAME);
-        }
-
-        std::process::exit(0);
+        clean_disconnect_and_exit(tx_signal, config_signal, "signal exit").await;
     });
 
     if session_timeout > 0 {
         let tx_timer = tx.clone();
+        let config_timer = config.clone();
         tokio::spawn(async move {
             session_started.notified().await;
             info!("{} ⏱️ session timeout: {} seconds started", NAME, session_timeout);
             tokio::time::sleep(std::time::Duration::from_secs(session_timeout.into())).await;
-            info!("{} ⏱️ session timeout: sending ByeByeRequest and exiting", NAME);
-            if let Some(sender) = tx_timer.lock().await.clone() {
-                let _ = send_byebye(sender).await;
-                // brief pause so the packet is transmitted before we exit
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            std::process::exit(0);
+            clean_disconnect_and_exit(tx_timer, config_timer, "session timeout").await;
         });
     }
 
