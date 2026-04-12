@@ -790,6 +790,9 @@ fn rewrite_media_config_ready(pkt: &mut Packet, max_unacked: u32) -> Result<()> 
     payload.insert(0, ((MEDIA_MESSAGE_CONFIG as u16) >> 8) as u8);
     payload.insert(1, ((MEDIA_MESSAGE_CONFIG as u16) & 0xff) as u8);
     pkt.payload = payload;
+    // Payload was rebuilt, so any old fragment metadata must be cleared.
+    pkt.final_length = None;
+    pkt.flags = (pkt.flags & !FRAME_TYPE_MASK) | FRAME_TYPE_FIRST | FRAME_TYPE_LAST;
     Ok(())
 }
 
@@ -802,6 +805,9 @@ fn rewrite_media_ack(pkt: &mut Packet, session_id: i32, ack_counter: u32) -> Res
     payload.insert(0, ((MEDIA_MESSAGE_ACK as u16) >> 8) as u8);
     payload.insert(1, ((MEDIA_MESSAGE_ACK as u16) & 0xff) as u8);
     pkt.payload = payload;
+    // Payload was rebuilt, so any old fragment metadata must be cleared.
+    pkt.final_length = None;
+    pkt.flags = (pkt.flags & !FRAME_TYPE_MASK) | FRAME_TYPE_FIRST | FRAME_TYPE_LAST;
     Ok(())
 }
 
@@ -824,6 +830,9 @@ fn rewrite_video_focus_notification(
         ((MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION as u16) & 0xff) as u8,
     );
     pkt.payload = payload;
+    // Payload was rebuilt, so any old fragment metadata must be cleared.
+    pkt.final_length = None;
+    pkt.flags = (pkt.flags & !FRAME_TYPE_MASK) | FRAME_TYPE_FIRST | FRAME_TYPE_LAST;
     Ok(())
 }
 
@@ -3776,6 +3785,8 @@ mod tests {
 
         let msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]) as i32;
         assert_eq!(msg_id, MEDIA_MESSAGE_CONFIG.value());
+        assert_eq!(pkt.final_length, None);
+        assert_eq!(pkt.flags & FRAME_TYPE_MASK, FRAME_TYPE_FIRST | FRAME_TYPE_LAST);
         let cfg = protos::Config::parse_from_bytes(&pkt.payload[2..]).unwrap();
         assert_eq!(cfg.status(), protos::config::Status::STATUS_READY);
         assert_eq!(cfg.max_unacked(), 1);
@@ -3830,6 +3841,11 @@ mod tests {
 
         let msg_id = u16::from_be_bytes([data_pkt.payload[0], data_pkt.payload[1]]) as i32;
         assert_eq!(msg_id, MEDIA_MESSAGE_ACK.value());
+        assert_eq!(data_pkt.final_length, None);
+        assert_eq!(
+            data_pkt.flags & FRAME_TYPE_MASK,
+            FRAME_TYPE_FIRST | FRAME_TYPE_LAST
+        );
         let ack = Ack::parse_from_bytes(&data_pkt.payload[2..]).unwrap();
         assert_eq!(ack.session_id(), 7);
         assert_eq!(ack.ack(), 1);
@@ -3904,6 +3920,8 @@ mod tests {
 
         let msg_id = u16::from_be_bytes([last_pkt.payload[0], last_pkt.payload[1]]) as i32;
         assert_eq!(msg_id, MEDIA_MESSAGE_ACK.value());
+        assert_eq!(last_pkt.final_length, None);
+        assert_eq!(last_pkt.flags & FRAME_TYPE_MASK, FRAME_TYPE_FIRST | FRAME_TYPE_LAST);
         let ack = Ack::parse_from_bytes(&last_pkt.payload[2..]).unwrap();
         assert_eq!(ack.session_id(), 11);
         assert_eq!(ack.ack(), 1);
