@@ -1,7 +1,9 @@
 use protobuf::Enum;
 use simplelog::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -44,17 +46,10 @@ pub struct MediaSink {
     tx: broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     /// Cached codec config frame sent to every new client on connect.
     codec_cfg: Arc<tokio::sync::Mutex<Option<Arc<Vec<u8>>>>>,
-    /// Cached video state used to serve a recent keyframe immediately to new clients.
-    cached_video: Arc<tokio::sync::Mutex<CachedVideoState>>,
     /// Stream metadata learned from ServiceDiscovery.
     stream_info: Arc<tokio::sync::Mutex<Option<MediaStreamInfo>>>,
-}
-
-#[derive(Default)]
-struct CachedVideoState {
-    pending_pts_us: Option<u64>,
-    pending_au: Vec<u8>,
-    last_idr: Option<Arc<(u64, Vec<u8>)>>,
+    /// Monotonic counter bumped each time a TCP client connects to this sink.
+    client_connect_gen: Arc<AtomicU64>,
 }
 
 impl MediaSink {
@@ -63,8 +58,8 @@ impl MediaSink {
         Self {
             tx,
             codec_cfg: Arc::new(tokio::sync::Mutex::new(None)),
-            cached_video: Arc::new(tokio::sync::Mutex::new(CachedVideoState::default())),
             stream_info: Arc::new(tokio::sync::Mutex::new(None)),
+            client_connect_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -101,29 +96,6 @@ impl MediaSink {
     }
 
     pub async fn send_frame(&self, pts_us: u64, data: Vec<u8>) {
-        let is_video = matches!(
-            self.get_stream_info().await,
-            Some(MediaStreamInfo {
-                kind: MediaStreamKind::Video { .. },
-                ..
-            })
-        );
-
-        if is_video {
-            let mut cached = self.cached_video.lock().await;
-            if cached.pending_pts_us == Some(pts_us) {
-                cached.pending_au.extend_from_slice(&data);
-            } else {
-                if let Some(prev_pts_us) = cached.pending_pts_us.replace(pts_us) {
-                    let au = std::mem::take(&mut cached.pending_au);
-                    if is_idr_frame(&au) {
-                        cached.last_idr = Some(Arc::new((prev_pts_us, au)));
-                    }
-                }
-                cached.pending_au.extend_from_slice(&data);
-            }
-        }
-
         let _ = self.tx.send(Arc::new((pts_us, data)));
     }
 
@@ -135,13 +107,18 @@ impl MediaSink {
         self.tx.receiver_count() > 0
     }
 
+    pub fn note_client_connected(&self) {
+        self.client_connect_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn client_connect_generation(&self) -> u64 {
+        self.client_connect_gen.load(Ordering::Relaxed)
+    }
+
     pub async fn get_codec_cfg(&self) -> Option<Arc<Vec<u8>>> {
         self.codec_cfg.lock().await.clone()
     }
 
-    pub async fn get_cached_idr(&self) -> Option<Arc<(u64, Vec<u8>)>> {
-        self.cached_video.lock().await.last_idr.clone()
-    }
 }
 
 fn audio_codec_name(codec: MediaCodecType) -> &'static str {
@@ -319,7 +296,7 @@ fn prepare_ts_audio_data(stream_info: &MediaStreamInfo, data: &[u8]) -> Option<V
 /// All streams (both audio and video) are delivered as MPEG-TS.
 /// If ServiceDiscovery has not yet completed when a client connects, the server
 /// keeps the connection alive with TS null packets until stream info arrives.
-pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_for_live_idr: bool) {
+pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_for_live_idr: bool) {
     let listener = match TcpListener::bind(format!("0.0.0.0:{port}")).await {
         Ok(l) => l,
         Err(e) => {
@@ -337,6 +314,7 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                 let sink = sink.clone();
                 let label = label.clone();
                 tokio::spawn(async move {
+                    let connected_at = Instant::now();
                     let stream_info = {
                         let mut info = sink.get_stream_info().await;
                         if info.is_none() {
@@ -367,6 +345,7 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                     };
 
                     if let MediaStreamKind::Audio { codec, .. } = stream_info.kind {
+                        sink.note_client_connected();
                         let ts_kind = match codec {
                             MediaCodecType::MEDIA_CODEC_AUDIO_PCM => TsStreamKind::AudioPcm,
                             _ => TsStreamKind::AudioAacAdts,
@@ -382,6 +361,9 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                             return;
                         }
                         let mut rx = sink.subscribe();
+                        let mut first_audio_frame_at: Option<Instant> = None;
+                        let mut lag_events: u64 = 0;
+                        let mut lagged_frames: u64 = 0;
                         let mut psi_ticker =
                             tokio::time::interval(std::time::Duration::from_secs(2));
                         psi_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -396,6 +378,13 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                                             if pts_us == 0 {
                                                 continue;
                                             }
+                                            if first_audio_frame_at.is_none() {
+                                                first_audio_frame_at = Some(Instant::now());
+                                                info!(
+                                                    "media_tcp_server: {addr} ({label}) first audio frame after {}ms",
+                                                    connected_at.elapsed().as_millis()
+                                                );
+                                            }
                                             let Some(ts_data) = prepare_ts_audio_data(&stream_info, data) else {
                                                 warn!(
                                                     "media_tcp_server: {addr} ({label}) missing audio config for codec {}",
@@ -409,8 +398,12 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                                             }
                                         }
                                         Err(broadcast::error::RecvError::Lagged(n)) => {
+                                            lag_events = lag_events.saturating_add(1);
+                                            lagged_frames = lagged_frames.saturating_add(n as u64);
                                             warn!(
-                                                "media_tcp_server: {addr} ({label}) lagged by {n} frames"
+                                                "media_tcp_server: {addr} ({label}) lagged by {n} audio frames (events={}, total_frames={})",
+                                                lag_events,
+                                                lagged_frames
                                             );
                                         }
                                         Err(broadcast::error::RecvError::Closed) => break,
@@ -424,51 +417,49 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                                 }
                             }
                         }
+                        info!(
+                            "media_tcp_server: {addr} ({label}) audio summary: lived={}ms first_frame={}ms lag_events={} lagged_frames={}",
+                            connected_at.elapsed().as_millis(),
+                            first_audio_frame_at
+                                .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            lag_events,
+                            lagged_frames
+                        );
                         info!("<green>media_tcp_server</>: client disconnected {addr} ({label})");
                         return;
                     }
 
+                    sink.note_client_connected();
                     info!("<green>media_tcp_server</>: client connected {addr} ({label})");
                     let mut rx = sink.subscribe();
                     let mut ts = MpegTsState::new();
                     let mut pending_pts_us: Option<u64> = None;
                     let mut pending_au = Vec::new();
+                    let mut first_video_frame_at: Option<Instant> = None;
+                    let mut first_idr_seen_at: Option<Instant> = None;
+                    let mut first_output_at: Option<Instant> = None;
+                    let mut lag_events: u64 = 0;
+                    let mut lagged_frames: u64 = 0;
+                    let mut sync_resets: u64 = 0;
+                    let mut unsynced_access_units: u64 = 0;
+                    let mut missing_codec_cfg_warned = false;
 
                     let initial_psi = ts.pat_pmt();
                     if stream.write_all(&initial_psi).await.is_err() {
                         return;
                     }
 
+                    // Gate output on the first live IDR.
+                    // Without this, real video frames flow into VLC's probe phase. By the
+                    // time VLC finishes probing and starts playing, those frames have PTS
+                    // values that are now in the past on VLC's clock, causing them to be
+                    // dropped as late. Null packets fill the probe window harmlessly.
+                    // Non-IDR frames before an IDR cannot be decoded anyway.
                     let mut synced = false;
-                    if let Some(cached_idr) = sink.get_cached_idr().await {
-                        let (pts_us, idr_au) = &*cached_idr;
-                        let idr_payload = if let Some(cfg) = sink.get_codec_cfg().await {
-                            let mut v = Vec::with_capacity(cfg.len() + idr_au.len());
-                            v.extend_from_slice(&cfg);
-                            v.extend_from_slice(idr_au);
-                            v
-                        } else {
-                            idr_au.clone()
-                        };
-                        let psi = ts.pat_pmt();
-                        if stream.write_all(&psi).await.is_err() {
-                            return;
-                        }
-                        let pkts = ts.video_pes(*pts_us, &idr_payload, true);
-                        if stream.write_all(&pkts).await.is_err() {
-                            return;
-                        }
-                        if wait_for_live_idr {
-                            info!(
-                                "media_tcp_server: {addr} ({label}) seeded from cached IDR preview, waiting for fresh live IDR"
-                            );
-                        } else {
-                            synced = true;
-                            info!(
-                                "media_tcp_server: {addr} ({label}) seeded from cached IDR and starting in low-latency mode"
-                            );
-                        }
-                    }
+                    info!(
+                        "media_tcp_server: {addr} ({label}) connected; waiting for first live IDR"
+                    );
 
                     let null_pkt = MpegTsState::null_packet();
                     let mut null_ticker =
@@ -485,41 +476,99 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                                         if pts_us == 0 {
                                             continue;
                                         }
+                                            if first_video_frame_at.is_none() {
+                                                first_video_frame_at = Some(Instant::now());
+                                                info!(
+                                                    "media_tcp_server: {addr} ({label}) first video frame after {}ms",
+                                                    connected_at.elapsed().as_millis()
+                                                );
+                                            }
                                         if pending_pts_us == Some(pts_us) {
                                             pending_au.extend_from_slice(data);
                                         } else {
                                             if let Some(flush_pts_us) = pending_pts_us.replace(pts_us) {
                                                 let access_unit = std::mem::take(&mut pending_au);
                                                 let is_idr = is_idr_frame(&access_unit);
-                                                if !synced && is_idr {
-                                                    synced = true;
-                                                    debug!(
-                                                        "media_tcp_server: {addr} ({label}) IDR sync'd, streaming MPEG-TS"
+
+                                                if is_idr && first_idr_seen_at.is_none() {
+                                                    first_idr_seen_at = Some(Instant::now());
+                                                    info!(
+                                                        "media_tcp_server: {addr} ({label}) first live IDR observed after {}ms",
+                                                        connected_at.elapsed().as_millis()
                                                     );
                                                 }
 
-                                                if synced && is_idr {
-                                                    let psi = ts.pat_pmt();
-                                                    if stream.write_all(&psi).await.is_err() {
-                                                        break;
+                                                if !synced {
+                                                    if is_idr {
+                                                        synced = true;
+                                                        let codec_cfg_len = sink.get_codec_cfg().await.map(|cfg| cfg.len());
+                                                        info!(
+                                                            "media_tcp_server: {addr} ({label}) IDR sync'd after {}ms, streaming MPEG-TS (codec_cfg={}{}).",
+                                                            connected_at.elapsed().as_millis(),
+                                                            if codec_cfg_len.is_some() { "yes" } else { "no" },
+                                                            codec_cfg_len
+                                                                .map(|len| format!(", {} bytes", len))
+                                                                .unwrap_or_default()
+                                                        );
+                                                        if codec_cfg_len.is_none() {
+                                                            warn!(
+                                                                "media_tcp_server: {addr} ({label}) no cached codec config at sync; decoder startup may stall until in-band SPS/PPS appears"
+                                                            );
+                                                            missing_codec_cfg_warned = true;
+                                                        }
+                                                    } else {
+                                                        unsynced_access_units = unsynced_access_units.saturating_add(1);
+                                                        if unsynced_access_units <= 4 || unsynced_access_units % 32 == 0 {
+                                                            info!(
+                                                                "media_tcp_server: {addr} ({label}) withholding unsynced AU #{} ({} bytes), waiting for IDR",
+                                                                unsynced_access_units,
+                                                                access_unit.len()
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
+                                                if synced {
+                                                    if is_idr {
+                                                        let psi = ts.pat_pmt();
+                                                        if stream.write_all(&psi).await.is_err() {
+                                                            break;
+                                                        }
+
+                                                        let idr_payload = if let Some(cfg) = sink.get_codec_cfg().await {
+                                                            let mut v =
+                                                                Vec::with_capacity(cfg.len() + access_unit.len());
+                                                            v.extend_from_slice(&cfg);
+                                                            v.extend_from_slice(&access_unit);
+                                                            v
+                                                        } else {
+                                                            if !missing_codec_cfg_warned {
+                                                                warn!(
+                                                                    "media_tcp_server: {addr} ({label}) emitting IDR without codec config; decoder may stay black until SPS/PPS is seen"
+                                                                );
+                                                                missing_codec_cfg_warned = true;
+                                                            }
+                                                            access_unit
+                                                        };
+                                                        let pkts =
+                                                            ts.video_pes(flush_pts_us, &idr_payload, true);
+                                                        if stream.write_all(&pkts).await.is_err() {
+                                                            break;
+                                                        }
+                                                    } else {
+                                                        let pkts =
+                                                            ts.video_pes(flush_pts_us, &access_unit, false);
+                                                        if stream.write_all(&pkts).await.is_err() {
+                                                            break;
+                                                        }
                                                     }
 
-                                                    let idr_payload = if let Some(cfg) = sink.get_codec_cfg().await {
-                                                        let mut v = Vec::with_capacity(cfg.len() + access_unit.len());
-                                                        v.extend_from_slice(&cfg);
-                                                        v.extend_from_slice(&access_unit);
-                                                        v
-                                                    } else {
-                                                        access_unit
-                                                    };
-                                                    let pkts = ts.video_pes(flush_pts_us, &idr_payload, true);
-                                                    if stream.write_all(&pkts).await.is_err() {
-                                                        break;
-                                                    }
-                                                } else if synced {
-                                                    let pkts = ts.video_pes(flush_pts_us, &access_unit, false);
-                                                    if stream.write_all(&pkts).await.is_err() {
-                                                        break;
+                                                    if first_output_at.is_none() {
+                                                        first_output_at = Some(Instant::now());
+                                                        info!(
+                                                            "media_tcp_server: {addr} ({label}) first video output after {}ms",
+                                                            connected_at.elapsed().as_millis()
+                                                        );
                                                     }
                                                 }
                                             }
@@ -528,10 +577,17 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                                            lag_events = lag_events.saturating_add(1);
+                                            lagged_frames = lagged_frames.saturating_add(n as u64);
                                         warn!(
-                                            "media_tcp_server: client {addr} ({label}) lagged by {n} frames, re-syncing"
+                                            "media_tcp_server: client {addr} ({label}) lagged by {n} video frames, re-syncing (events={}, total_frames={}, lived={}ms)",
+                                            lag_events,
+                                            lagged_frames,
+                                            connected_at.elapsed().as_millis()
                                         );
+                                        sync_resets = sync_resets.saturating_add(1);
                                         synced = false;
+                                        ts = MpegTsState::new(); // reset PTS baseline on resync
                                         pending_pts_us = None;
                                         pending_au.clear();
                                     }
@@ -542,13 +598,27 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, wait_fo
                                 if stream.write_all(&null_pkt).await.is_err() {
                                     break;
                                 }
-                                let psi = ts.pat_pmt();
-                                if stream.write_all(&psi).await.is_err() {
-                                    break;
-                                }
                             }
                         }
                     }
+                    info!(
+                        "media_tcp_server: {addr} ({label}) video summary: lived={}ms first_frame={}ms first_live_idr={}ms first_output={}ms lag_events={} lagged_frames={} sync_resets={} unsynced_au={} wait_for_live_idr={}",
+                        connected_at.elapsed().as_millis(),
+                        first_video_frame_at
+                            .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        first_idr_seen_at
+                            .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        first_output_at
+                            .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        lag_events,
+                        lagged_frames,
+                        sync_resets,
+                        unsynced_access_units,
+                        false
+                    );
                     info!("<green>media_tcp_server</>: client disconnected {addr} ({label})");
                 });
             }
@@ -739,7 +809,7 @@ pub(crate) async fn tap_media_message(
                     let idr = is_idr_frame(media_data);
                     if idr {
                         info!(
-                            "{} <blue>media tap IDR</> ch {:#04x}: pts={}us, {} nal bytes, first: {:02X?}",
+                            "{} <blue>media tap:</> received IDR from phone on ch {:#04x}: pts={}us, {} nal bytes, first: {:02X?}",
                             tap_name(proxy_type),
                             pkt.channel,
                             pts_us,

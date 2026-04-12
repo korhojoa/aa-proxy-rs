@@ -149,6 +149,10 @@ pub struct ModifyContext {
     injected_media_display: HashMap<u8, DisplayType>,
     /// Per-channel media state for injected virtual sinks (hidden from HU).
     injected_media_state: HashMap<u8, InjectedMediaState>,
+    /// Last observed tap client connection generation by media channel.
+    injected_media_connect_gen: HashMap<u8, u64>,
+    /// Last observed tap-consumer presence by media channel.
+    injected_media_had_tap_client: HashMap<u8, bool>,
     /// Runtime counters for injected virtual sink packets.
     injected_media_counters: InjectedMediaCounters,
     /// True once MobileDevice proxy has forwarded SDR towards the phone.
@@ -846,30 +850,251 @@ fn maybe_emit_pending_injected_focus(
     tx: &Sender<Packet>,
 ) -> Result<()> {
     let mut ready_channels: Vec<(u8, u8, bool)> = Vec::new();
+    let mut toggle_channels: Vec<(u8, u8)> = Vec::new();
+    let mut release_channels: Vec<(u8, u8)> = Vec::new();
+    let mut connect_gen_updates: Vec<(u8, u64)> = Vec::new();
+    let mut tap_presence_updates: Vec<(u8, bool)> = Vec::new();
 
     for (&channel, state) in &ctx.injected_media_state {
+        let sink = ctx.media_channels.get(&channel);
+        let has_tap_client = sink.map(|s| s.has_subscribers()).unwrap_or(false);
+        let connect_gen = sink
+            .map(|s| s.client_connect_generation())
+            .unwrap_or_default();
+        let seen_connect_gen = ctx
+            .injected_media_connect_gen
+            .get(&channel)
+            .copied()
+            .unwrap_or_default();
+        let new_connection = connect_gen > seen_connect_gen;
+        let had_tap_client = ctx
+            .injected_media_had_tap_client
+            .get(&channel)
+            .copied()
+            .unwrap_or(false);
+        let lost_last_consumer = had_tap_client && !has_tap_client;
+
+        connect_gen_updates.push((channel, connect_gen));
+        tap_presence_updates.push((channel, has_tap_client));
+
+        let is_cluster = ctx
+            .injected_media_display
+            .get(&channel)
+            .copied()
+            .unwrap_or(DisplayType::DISPLAY_TYPE_CLUSTER)
+            == DisplayType::DISPLAY_TYPE_CLUSTER;
+
+        if new_connection
+            && has_tap_client
+            && is_cluster
+            && matches!(
+                state.phase,
+                InjectedMediaPhase::FocusSent
+                    | InjectedMediaPhase::Started
+                    | InjectedMediaPhase::Streaming
+            )
+        {
+            toggle_channels.push((channel, state.last_flags));
+        }
+
+        // Reconnect into Idle: re-acquire projected focus so the phone restarts the stream.
+        if new_connection
+            && has_tap_client
+            && is_cluster
+            && state.phase == InjectedMediaPhase::Idle
+        {
+            info!(
+                "{} <blue>injected media:</> new tap client on channel {:#04x} in idle phase; re-acquiring projected focus",
+                get_name(proxy_type),
+                channel
+            );
+            ready_channels.push((channel, state.last_flags, has_tap_client));
+        }
+
+        if lost_last_consumer
+            && is_cluster
+            && !cfg.inject_force_focus_without_tap
+            && matches!(
+                state.phase,
+                InjectedMediaPhase::FocusSent
+                    | InjectedMediaPhase::Started
+                    | InjectedMediaPhase::Streaming
+            )
+        {
+            release_channels.push((channel, state.last_flags));
+        }
+
         if !state.phase.awaiting_focus() {
             continue;
         }
 
-        let has_tap_client = ctx
-            .media_channels
-            .get(&channel)
-            .map(|sink| sink.has_subscribers())
-            .unwrap_or(false);
-
         debug!(
-            "{} deferred_focus check: ch={:#04x} phase={} tap_client={} force={} media_channels_has_sink={}",
+            "{} deferred_focus check: ch={:#04x} phase={} tap_client={} force={} media_channels_has_sink={} connect_gen={} seen_connect_gen={} new_connection={}",
             get_name(proxy_type),
             channel,
             injected_phase_label(state.phase),
             has_tap_client,
             cfg.inject_force_focus_without_tap,
-            ctx.media_channels.contains_key(&channel)
+            ctx.media_channels.contains_key(&channel),
+            connect_gen,
+            seen_connect_gen,
+            new_connection
         );
 
         if has_tap_client || cfg.inject_force_focus_without_tap {
             ready_channels.push((channel, state.last_flags, has_tap_client));
+        }
+    }
+
+    // Reacquire projected focus on fresh cluster tap connections even if we do not
+    // currently have injected media runtime state for that channel.
+    for (&channel, &display_type) in &ctx.injected_media_display {
+        if display_type != DisplayType::DISPLAY_TYPE_CLUSTER {
+            continue;
+        }
+        if ctx.injected_media_state.contains_key(&channel) {
+            continue;
+        }
+
+        let Some(sink) = ctx.media_channels.get(&channel) else {
+            continue;
+        };
+
+        let has_tap_client = sink.has_subscribers();
+        let connect_gen = sink.client_connect_generation();
+        let seen_connect_gen = ctx
+            .injected_media_connect_gen
+            .get(&channel)
+            .copied()
+            .unwrap_or_default();
+        let new_connection = connect_gen > seen_connect_gen;
+
+        connect_gen_updates.push((channel, connect_gen));
+        tap_presence_updates.push((channel, has_tap_client));
+
+        if new_connection && has_tap_client {
+            debug!(
+                "{} deferred_focus check: ch={:#04x} phase=absent tap_client=true force={} media_channels_has_sink=true connect_gen={} seen_connect_gen={} new_connection=true",
+                get_name(proxy_type),
+                channel,
+                cfg.inject_force_focus_without_tap,
+                connect_gen,
+                seen_connect_gen,
+            );
+            toggle_channels.push((channel, ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST));
+        }
+    }
+
+    for (channel, connect_gen) in connect_gen_updates {
+        ctx.injected_media_connect_gen.insert(channel, connect_gen);
+    }
+
+    for (channel, has_tap_client) in tap_presence_updates {
+        ctx.injected_media_had_tap_client
+            .insert(channel, has_tap_client);
+    }
+
+    for (channel, flags) in release_channels {
+        let mut release_focus_pkt = Packet {
+            channel,
+            flags,
+            final_length: None,
+            payload: Vec::new(),
+        };
+        rewrite_video_focus_notification(
+            &mut release_focus_pkt,
+            VideoFocusMode::VIDEO_FOCUS_NATIVE,
+            true,
+        )?;
+
+        info!(
+            "{} <blue>injected media:</> last tap client disconnected on channel <b>{:#04x}</>; releasing projected focus",
+            get_name(proxy_type),
+            channel
+        );
+
+        match tx.try_send(release_focus_pkt) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "{} <yellow>cluster focus release backpressure:</> queue full while sending native focus for channel <b>{:#04x}</>; will retry",
+                    get_name(proxy_type),
+                    channel
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err("injected focus queue closed".into());
+            }
+        }
+    }
+
+    for (channel, flags) in toggle_channels {
+        let mut drop_focus_pkt = Packet {
+            channel,
+            flags,
+            final_length: None,
+            payload: Vec::new(),
+        };
+        rewrite_video_focus_notification(
+            &mut drop_focus_pkt,
+            VideoFocusMode::VIDEO_FOCUS_NATIVE,
+            true,
+        )?;
+
+        let mut project_focus_pkt = Packet {
+            channel,
+            flags,
+            final_length: None,
+            payload: Vec::new(),
+        };
+        rewrite_video_focus_notification(
+            &mut project_focus_pkt,
+            VideoFocusMode::VIDEO_FOCUS_PROJECTED,
+            true,
+        )?;
+
+        info!(
+            "{} <blue>injected media:</> cluster tap client connected on channel <b>{:#04x}</>; toggling VIDEO_FOCUS_NOTIFICATION native→projected",
+            get_name(proxy_type),
+            channel
+        );
+
+        let mut drop_sent = false;
+        match tx.try_send(drop_focus_pkt) {
+            Ok(()) => {
+                drop_sent = true;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "{} <yellow>cluster focus toggle backpressure:</> queue full while sending native focus for channel <b>{:#04x}</>; will retry",
+                    get_name(proxy_type),
+                    channel
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err("injected focus queue closed".into());
+            }
+        }
+
+        match tx.try_send(project_focus_pkt) {
+            Ok(()) => {
+                debug!(
+                    "{} cluster focus toggle on channel <b>{:#04x}</>: native_sent={} projected_sent=true",
+                    get_name(proxy_type),
+                    channel,
+                    drop_sent
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "{} <yellow>cluster focus toggle backpressure:</> queue full while sending projected focus for channel <b>{:#04x}</>; will retry",
+                    get_name(proxy_type),
+                    channel
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err("injected focus queue closed".into());
+            }
         }
     }
 
@@ -3257,6 +3482,8 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         injected_channels: HashSet::new(),
         injected_media_display: HashMap::new(),
         injected_media_state: HashMap::new(),
+        injected_media_connect_gen: HashMap::new(),
+        injected_media_had_tap_client: HashMap::new(),
         injected_media_counters: InjectedMediaCounters::default(),
         md_sdr_forwarded: false,
         md_control_after_sdr: 0,
@@ -3283,6 +3510,9 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         open_rsp_to_endpoint: 0,
     };
     let mut control_stats = ControlRuntimeStats::default();
+    let mut focus_poll = tokio::time::interval(Duration::from_millis(100));
+    focus_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    focus_poll.tick().await;
     loop {
         tokio::select! {
         // handling data from opposite device's thread, which needs to be transmitted
@@ -3521,6 +3751,10 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 Err(e) => error!("decrypt_payload: {:?}", e),
             }
         }
+
+        _ = focus_poll.tick(), if proxy_type == ProxyType::HeadUnit => {
+            maybe_emit_pending_injected_focus(proxy_type, &mut ctx, &cfg, &tx)?;
+        }
         }
     }
 }
@@ -3575,6 +3809,8 @@ mod tests {
             injected_channels: HashSet::new(),
             injected_media_display: HashMap::new(),
             injected_media_state: HashMap::new(),
+            injected_media_connect_gen: HashMap::new(),
+            injected_media_had_tap_client: HashMap::new(),
             injected_media_counters: InjectedMediaCounters::default(),
             md_sdr_forwarded: false,
             md_control_after_sdr: 0,

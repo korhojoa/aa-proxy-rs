@@ -62,5 +62,5 @@ startup_delay = 0
 ble_password = ""
 external_antenna = false
 media_dump_base_port = 12345
-media_wait_for_live_idr = true
+media_wait_for_live_idr = false
 inject_force_focus_without_tap = false
