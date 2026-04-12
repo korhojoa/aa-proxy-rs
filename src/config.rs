@@ -86,6 +86,8 @@ pub struct AppConfig {
     pub debug: bool,
     pub hexdump_level: HexdumpLevel,
     pub disable_console_debug: bool,
+    #[serde(default)]
+    pub trace_channel_flow: bool,
     pub legacy: bool,
     pub quick_reconnect: bool,
     pub bt_poweroff: bool,
@@ -134,6 +136,10 @@ pub struct AppConfig {
     pub inject_aux_viewing_distance: u16,
     pub inject_aux_touch_width: u16,
     pub inject_aux_touch_height: u16,
+    /// Test-mode override: send injected video focus even without active tap clients.
+    /// Default false keeps injected streams idle until a tap client connects.
+    #[serde(default)]
+    pub inject_force_focus_without_tap: bool,
     pub change_usb_order: bool,
     pub stop_on_disconnect: bool,
     pub waze_lht_workaround: bool,
@@ -255,6 +261,7 @@ impl Default for AppConfig {
             debug: false,
             hexdump_level: HexdumpLevel::Disabled,
             disable_console_debug: false,
+            trace_channel_flow: false,
             legacy: true,
             quick_reconnect: false,
             bt_poweroff: false,
@@ -296,6 +303,7 @@ impl Default for AppConfig {
             inject_aux_viewing_distance: 300,
             inject_aux_touch_width: 1280,
             inject_aux_touch_height: 720,
+            inject_force_focus_without_tap: false,
             change_usb_order: false,
             stop_on_disconnect: false,
             waze_lht_workaround: false,
@@ -367,6 +375,7 @@ impl AppConfig {
         doc["debug"] = value(self.debug);
         doc["hexdump_level"] = value(format!("{:?}", self.hexdump_level));
         doc["disable_console_debug"] = value(self.disable_console_debug);
+        doc["trace_channel_flow"] = value(self.trace_channel_flow);
         doc["legacy"] = value(self.legacy);
         doc["quick_reconnect"] = value(self.quick_reconnect);
         doc["bt_poweroff"] = value(self.bt_poweroff);
@@ -402,11 +411,9 @@ impl AppConfig {
         doc["inject_add_input_sources"] = value(self.inject_add_input_sources);
         doc["inject_cluster_display_id"] = value(self.inject_cluster_display_id as i64);
         doc["inject_cluster_width_margin"] = value(self.inject_cluster_width_margin as i64);
-        doc["inject_cluster_height_margin"] =
-            value(self.inject_cluster_height_margin as i64);
+        doc["inject_cluster_height_margin"] = value(self.inject_cluster_height_margin as i64);
         doc["inject_cluster_density"] = value(self.inject_cluster_density as i64);
-        doc["inject_cluster_viewing_distance"] =
-            value(self.inject_cluster_viewing_distance as i64);
+        doc["inject_cluster_viewing_distance"] = value(self.inject_cluster_viewing_distance as i64);
         doc["inject_cluster_touch_width"] = value(self.inject_cluster_touch_width as i64);
         doc["inject_cluster_touch_height"] = value(self.inject_cluster_touch_height as i64);
         doc["inject_aux_display_id"] = value(self.inject_aux_display_id as i64);
@@ -416,6 +423,7 @@ impl AppConfig {
         doc["inject_aux_viewing_distance"] = value(self.inject_aux_viewing_distance as i64);
         doc["inject_aux_touch_width"] = value(self.inject_aux_touch_width as i64);
         doc["inject_aux_touch_height"] = value(self.inject_aux_touch_height as i64);
+        doc["inject_force_focus_without_tap"] = value(self.inject_force_focus_without_tap);
         doc["change_usb_order"] = value(self.change_usb_order);
         doc["stop_on_disconnect"] = value(self.stop_on_disconnect);
         doc["waze_lht_workaround"] = value(self.waze_lht_workaround);

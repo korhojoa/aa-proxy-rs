@@ -124,7 +124,11 @@ pub async fn send_ev_data(tx: Sender<Packet>, sensor_ch: u8, batt: BatteryData) 
 }
 
 /// Inject toll card presence data via sensor batch.
-pub async fn send_toll_card(tx: Sender<Packet>, sensor_ch: u8, is_card_present: bool) -> Result<()> {
+pub async fn send_toll_card(
+    tx: Sender<Packet>,
+    sensor_ch: u8,
+    is_card_present: bool,
+) -> Result<()> {
     let mut msg = SensorBatch::new();
     let mut toll = TollCardData::new();
     toll.set_is_card_present(is_card_present);

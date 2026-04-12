@@ -84,9 +84,7 @@ fn parse_display_type_token(token: &str) -> Option<DisplayType> {
     match token.trim().to_ascii_lowercase().as_str() {
         "main" | "display_type_main" => Some(DisplayType::DISPLAY_TYPE_MAIN),
         "cluster" | "display_type_cluster" => Some(DisplayType::DISPLAY_TYPE_CLUSTER),
-        "aux" | "auxiliary" | "display_type_auxiliary" => {
-            Some(DisplayType::DISPLAY_TYPE_AUXILIARY)
-        }
+        "aux" | "auxiliary" | "display_type_auxiliary" => Some(DisplayType::DISPLAY_TYPE_AUXILIARY),
         _ => None,
     }
 }
@@ -105,9 +103,7 @@ impl std::str::FromStr for DisplayType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         parse_display_type_token(s)
-            .or_else(|| {
-                <mitm::protos::DisplayType as protobuf::Enum>::from_str(s.trim())
-            })
+            .or_else(|| <mitm::protos::DisplayType as protobuf::Enum>::from_str(s.trim()))
             .ok_or_else(|| format!("Unknown display type: {}", s))
     }
 }
@@ -211,9 +207,7 @@ impl<'de> Deserialize<'de> for InjectDisplayTypes {
             for part in s.split(',') {
                 let trimmed = part.trim();
                 if !trimmed.is_empty() {
-                    let display_type = trimmed
-                        .parse::<DisplayType>()
-                        .map_err(de::Error::custom)?;
+                    let display_type = trimmed.parse::<DisplayType>().map_err(de::Error::custom)?;
                     if !types.contains(&display_type) {
                         types.push(display_type);
                     }

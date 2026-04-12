@@ -344,8 +344,7 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
     } else {
         debug!(
             "{} skipping reverse tcp_bridge for localhost client ({})",
-            NAME,
-            addr
+            NAME, addr
         );
     }
 
@@ -526,10 +525,8 @@ pub async fn io_loop(
         // MITM/proxy mpsc channels:
         // Keep enough in-flight capacity so reader tasks do not stall under bursty
         // media traffic and starve control-channel forwarding.
-        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) =
-            mpsc::channel(MITM_QUEUE_CAPACITY);
-        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) =
-            mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(MITM_QUEUE_CAPACITY);
         let (txr_hu, rxr_md): (Sender<Packet>, Receiver<Packet>) =
             mpsc::channel(MITM_QUEUE_CAPACITY);
         let (txr_md, rxr_hu): (Sender<Packet>, Receiver<Packet>) =
@@ -593,7 +590,7 @@ pub async fn io_loop(
             sensor_channel.clone(),
             input_channel.clone(),
             ev_tx.clone(),
-            HashMap::new(),
+            persistent_media_sinks.clone(),
         ));
         from_stream = tokio_uring::spawn(proxy(
             ProxyType::MobileDevice,
@@ -609,10 +606,11 @@ pub async fn io_loop(
             persistent_media_sinks.clone(),
         ));
 
-        // Thread for monitoring transfer
-            session_started.notify_one();
+        // Wake all session-start waiters: active-session timeout, connection-start timeout,
+        // and any future observers that need to react once proxying actually begins.
+        session_started.notify_waiters();
 
-            // Thread for monitoring transfer
+        // Thread for monitoring transfer
         let mut monitor = tokio::spawn(transfer_monitor(
             stats_interval,
             file_bytes,

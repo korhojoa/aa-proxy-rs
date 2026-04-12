@@ -4,9 +4,9 @@ use crate::config::ConfigJson;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
 use crate::ev::send_byebye;
+use crate::ev::send_ev_data;
 use crate::ev::send_input_key;
 use crate::ev::send_toll_card;
-use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
 use crate::mitm::Packet;
@@ -268,16 +268,25 @@ async fn send_toll_card_from_web(state: Arc<AppState>, is_card_present: bool) ->
         if let Some(tx) = state.tx.lock().await.clone() {
             if let Err(e) = send_toll_card(tx.clone(), ch, is_card_present).await {
                 error!("{} Toll card send error: {}", NAME, e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send toll card data")
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to send toll card data",
+                )
                     .into_response();
             }
             return (StatusCode::OK, "OK").into_response();
         }
-        warn!("{} Not sending toll card packet because tx is unavailable", NAME);
+        warn!(
+            "{} Not sending toll card packet because tx is unavailable",
+            NAME
+        );
         return (StatusCode::SERVICE_UNAVAILABLE, "No active session tx").into_response();
     }
 
-    warn!("{} Not sending toll card packet because no sensor channel yet", NAME);
+    warn!(
+        "{} Not sending toll card packet because no sensor channel yet",
+        NAME
+    );
     (StatusCode::SERVICE_UNAVAILABLE, "No sensor channel yet").into_response()
 }
 
@@ -301,7 +310,10 @@ pub async fn input_key_handler(
     Json(data): Json<InputKeyRequest>,
 ) -> impl IntoResponse {
     let Some(input_ch) = *state.input_channel.lock().await else {
-        warn!("{} Not sending key packet because no input channel yet", NAME);
+        warn!(
+            "{} Not sending key packet because no input channel yet",
+            NAME
+        );
         return (StatusCode::SERVICE_UNAVAILABLE, "No input channel yet").into_response();
     };
 
@@ -317,15 +329,28 @@ pub async fn input_key_handler(
         // Default behavior is a tap: press and release.
         if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, true, longpress).await {
             error!("{} Input key send (down) error: {}", NAME, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send key event").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to send key event",
+            )
+                .into_response();
         }
         if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, false, longpress).await {
             error!("{} Input key send (up) error: {}", NAME, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send key event").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to send key event",
+            )
+                .into_response();
         }
-    } else if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, down, longpress).await {
+    } else if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, down, longpress).await
+    {
         error!("{} Input key send error: {}", NAME, e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send key event").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to send key event",
+        )
+            .into_response();
     }
 
     (StatusCode::OK, "OK").into_response()

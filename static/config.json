@@ -100,6 +100,10 @@
         "disable_console_debug": {
           "typ": "boolean",
           "description": "Disable debug level on console, save it only to logfile (helpful for `hexdump-level` option)"
+        },
+        "trace_channel_flow": {
+          "typ": "boolean",
+          "description": "Emit concise MITM flow trace lines at INFO level for injected cluster debugging (state transitions, ACK milestones, ping/focus/channel-open control). Use this with `debug = false` to keep logs focused."
         }
       }
     },

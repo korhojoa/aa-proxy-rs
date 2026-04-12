@@ -53,11 +53,33 @@ fn get_name(proxy_type: ProxyType) -> String {
 }
 
 // Just a generic Result type to ease error handling for us. Errors in multithreaded
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InjectedMediaPhase {
+    #[default]
+    Idle,
+    SetupSeen,
+    FocusSent,
+    Started,
+    Streaming,
+}
+
+impl InjectedMediaPhase {
+    fn can_stream(self) -> bool {
+        matches!(self, Self::Started | Self::Streaming)
+    }
+
+    fn awaiting_focus(self) -> bool {
+        matches!(self, Self::SetupSeen)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct InjectedMediaState {
+    phase: InjectedMediaPhase,
     session_id: i32,
     ack_counter: u32,
-    started: bool,
+    last_flags: u8,
+    trace_after_start: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -341,14 +363,7 @@ fn add_display_services(msg: &mut ServiceDiscoveryResponse, cfg: &AppConfig) -> 
             added += 1;
         }
 
-        // DHU is sensitive to synthetic cluster input services and can reject
-        // the session with GAL -4 while main video stays blank. Keep injecting
-        // input sources only for auxiliary displays unless the HU already
-        // advertises one.
-        if cfg.inject_add_input_sources
-            && profile.display_type == DisplayType::DISPLAY_TYPE_AUXILIARY
-            && !has_input_display(msg, profile.display_id)
-        {
+        if cfg.inject_add_input_sources && !has_input_display(msg, profile.display_id) {
             let id = next_service_id(msg);
             msg.services
                 .push(create_input_source_service(id, profile));
@@ -454,7 +469,7 @@ fn describe_media_service(svc: &Service) -> Option<String> {
         Some(format!(
             "id={} video codec={:?} display={:?}/{} res={:?} fps={:?} margin={}x{} density={} real_density={} viewing_distance={}",
             svc.id(),
-            svc.media_sink_service.available_type(),
+            video_cfg.video_codec_type(),
             svc.media_sink_service.display_type(),
             svc.media_sink_service.display_id(),
             video_cfg.codec_resolution(),
@@ -659,6 +674,112 @@ fn maybe_log_injected_media_counters(
     );
 }
 
+fn injected_phase_label(phase: InjectedMediaPhase) -> &'static str {
+    match phase {
+        InjectedMediaPhase::Idle => "idle",
+        InjectedMediaPhase::SetupSeen => "setup_seen",
+        InjectedMediaPhase::FocusSent => "focus_sent",
+        InjectedMediaPhase::Started => "started",
+        InjectedMediaPhase::Streaming => "streaming",
+    }
+}
+
+fn trace_injected_phase_transition(
+    cfg: &AppConfig,
+    proxy_type: ProxyType,
+    channel: u8,
+    display_type: DisplayType,
+    from: InjectedMediaPhase,
+    to: InjectedMediaPhase,
+    reason: &str,
+    session_id: i32,
+    ack_counter: u32,
+) {
+    if !cfg.trace_channel_flow || from == to {
+        return;
+    }
+
+    info!(
+        "{} <cyan>flow trace:</> injected phase {} -> {} on channel <b>{:#04x}</> display={:?} reason={} session_id={} ack={}",
+        get_name(proxy_type),
+        injected_phase_label(from),
+        injected_phase_label(to),
+        channel,
+        display_type,
+        reason,
+        session_id,
+        ack_counter,
+    );
+}
+
+fn frame_type_label(flags: u8) -> &'static str {
+    match flags & FRAME_TYPE_MASK {
+        f if f == (FRAME_TYPE_FIRST | FRAME_TYPE_LAST) => "first+last",
+        f if f == FRAME_TYPE_FIRST => "first",
+        f if f == FRAME_TYPE_LAST => "last",
+        _ => "middle",
+    }
+}
+
+fn first_fragment_message_id(pkt: &Packet) -> Option<u16> {
+    if pkt.payload.len() < 2 {
+        return None;
+    }
+
+    match pkt.flags & FRAME_TYPE_MASK {
+        f if f == FRAME_TYPE_FIRST || f == (FRAME_TYPE_FIRST | FRAME_TYPE_LAST) => {
+            Some(u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]))
+        }
+        _ => None,
+    }
+}
+
+fn debug_injected_probe(proxy_type: ProxyType, leg: &str, pkt: &Packet, ctx: &ModifyContext) {
+    let is_injected = ctx.injected_channels.contains(&pkt.channel)
+        || ctx.injected_media_display.contains_key(&pkt.channel)
+        || ctx.injected_media_state.contains_key(&pkt.channel);
+    if !is_injected {
+        return;
+    }
+
+    let msg_id = first_fragment_message_id(pkt)
+        .map(|id| format!("0x{id:04X}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let state = ctx.injected_media_state.get(&pkt.channel);
+    let (phase, session_id, ack_counter, trace_after_start) = state
+        .map(|s| {
+            (
+                s.phase,
+                s.session_id,
+                s.ack_counter,
+                s.trace_after_start,
+            )
+        })
+        .unwrap_or((InjectedMediaPhase::Idle, 0, 0, 0));
+    let frag = ctx.media_fragments.get(&pkt.channel);
+    let (frag_len, frag_expected) = frag
+        .map(|f| (f.data.len(), f.expected_len))
+        .unwrap_or((0, None));
+
+    debug!(
+        "{} <blue>injected probe:</> leg={} channel={:#04x} flags=0x{:02X} frame={} msg_id={} payload_len={} final_len={:?} phase={} session_id={} ack={} trace_after_start={} frag_len={} frag_expected={:?}",
+        get_name(proxy_type),
+        leg,
+        pkt.channel,
+        pkt.flags,
+        frame_type_label(pkt.flags),
+        msg_id,
+        pkt.payload.len(),
+        pkt.final_length,
+        injected_phase_label(phase),
+        session_id,
+        ack_counter,
+        trace_after_start,
+        frag_len,
+        frag_expected,
+    );
+}
+
 fn rewrite_media_config_ready(pkt: &mut Packet, max_unacked: u32) -> Result<()> {
     let mut cfg = protos::Config::new();
     cfg.set_status(protos::config::Status::STATUS_READY);
@@ -706,17 +827,131 @@ fn rewrite_video_focus_notification(
     Ok(())
 }
 
+fn maybe_emit_pending_injected_focus(
+    proxy_type: ProxyType,
+    ctx: &mut ModifyContext,
+    cfg: &AppConfig,
+    tx: &Sender<Packet>,
+) -> Result<()> {
+    let mut ready_channels: Vec<(u8, u8, bool)> = Vec::new();
+
+    for (&channel, state) in &ctx.injected_media_state {
+        if !state.phase.awaiting_focus() {
+            continue;
+        }
+
+        let has_tap_client = ctx
+            .media_channels
+            .get(&channel)
+            .map(|sink| sink.has_subscribers())
+            .unwrap_or(false);
+
+        debug!(
+            "{} deferred_focus check: ch={:#04x} phase={} tap_client={} force={} media_channels_has_sink={}",
+            get_name(proxy_type),
+            channel,
+            injected_phase_label(state.phase),
+            has_tap_client,
+            cfg.inject_force_focus_without_tap,
+            ctx.media_channels.contains_key(&channel)
+        );
+
+        if has_tap_client || cfg.inject_force_focus_without_tap {
+            ready_channels.push((channel, state.last_flags, has_tap_client));
+        }
+    }
+
+    for (channel, flags, has_tap_client) in ready_channels {
+        let mut focus_pkt = Packet {
+            channel,
+            flags,
+            final_length: None,
+            payload: Vec::new(),
+        };
+        rewrite_video_focus_notification(
+            &mut focus_pkt,
+            VideoFocusMode::VIDEO_FOCUS_PROJECTED,
+            true,
+        )?;
+        info!(
+            "{} <blue>injected media:</> synthesized VIDEO_FOCUS_NOTIFICATION on channel <b>{:#04x}</> tap_client={} force={}",
+            get_name(proxy_type),
+            channel,
+            has_tap_client,
+            cfg.inject_force_focus_without_tap
+        );
+
+        match tx.try_send(focus_pkt) {
+            Ok(()) => {
+                if let Some(state) = ctx.injected_media_state.get_mut(&channel) {
+                    let prev_phase = state.phase;
+                    state.phase = InjectedMediaPhase::FocusSent;
+                    trace_injected_phase_transition(
+                        cfg,
+                        proxy_type,
+                        channel,
+                        ctx.injected_media_display
+                            .get(&channel)
+                            .copied()
+                            .unwrap_or(DisplayType::DISPLAY_TYPE_CLUSTER),
+                        prev_phase,
+                        state.phase,
+                        "deferred_focus",
+                        state.session_id,
+                        state.ack_counter,
+                    );
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "{} <yellow>deferred focus backpressure:</> queue full while emitting focus for channel <b>{:#04x}</>; will retry",
+                    get_name(proxy_type),
+                    channel
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err("injected focus queue closed".into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn emulate_injected_media_packet(
     proxy_type: ProxyType,
     pkt: &mut Packet,
     ctx: &mut ModifyContext,
+    reassembled_frame: Option<&[u8]>,
+    has_fragment_state: bool,
+    cfg: &AppConfig,
 ) -> Result<bool> {
-    if pkt.payload.len() < 2 {
-        return Ok(false);
-    }
+    let message_id = first_fragment_message_id(pkt)
+        .or_else(|| {
+            reassembled_frame.and_then(|frame| {
+                if frame.len() >= 2 {
+                    Some(u16::from_be_bytes([frame[0], frame[1]]))
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            if has_fragment_state {
+                Some(MEDIA_MESSAGE_DATA.value() as u16)
+            } else {
+                None
+            }
+        });
 
-    let message_id: i32 = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]).into();
-    let data = &pkt.payload[2..];
+    let Some(message_id) = message_id else {
+        return Ok(false);
+    };
+
+    let data = reassembled_frame
+        .and_then(|frame| frame.get(2..))
+        .or_else(|| pkt.payload.get(2..))
+        .unwrap_or_default();
     let state = ctx.injected_media_state.entry(pkt.channel).or_default();
     let display_type = ctx
         .injected_media_display
@@ -725,10 +960,26 @@ fn emulate_injected_media_packet(
         .unwrap_or(DisplayType::DISPLAY_TYPE_CLUSTER);
     let max_unacked = injected_max_unacked(display_type);
 
-    match protos::MediaMessageId::from_i32(message_id).unwrap_or(MEDIA_MESSAGE_DATA) {
+    match protos::MediaMessageId::from_i32(message_id.into()).unwrap_or(MEDIA_MESSAGE_DATA) {
         MEDIA_MESSAGE_SETUP => {
             ctx.injected_media_counters.setup_seen =
                 ctx.injected_media_counters.setup_seen.saturating_add(1);
+            let prev_phase = state.phase;
+            state.phase = InjectedMediaPhase::SetupSeen;
+            state.session_id = 0;
+            state.ack_counter = 0;
+            state.last_flags = pkt.flags;
+            trace_injected_phase_transition(
+                cfg,
+                proxy_type,
+                pkt.channel,
+                display_type,
+                prev_phase,
+                state.phase,
+                "media_setup",
+                state.session_id,
+                state.ack_counter,
+            );
             info!(
                 "{} <blue>injected media:</> SETUP on channel <b>{:#04x}</> display={:?}",
                 get_name(proxy_type),
@@ -751,9 +1002,23 @@ fn emulate_injected_media_packet(
             ctx.injected_media_counters.start_seen =
                 ctx.injected_media_counters.start_seen.saturating_add(1);
             if let Ok(msg) = Start::parse_from_bytes(data) {
+                let prev_phase = state.phase;
                 state.session_id = msg.session_id();
                 state.ack_counter = 0;
-                state.started = true;
+                state.phase = InjectedMediaPhase::Started;
+                state.last_flags = pkt.flags;
+                state.trace_after_start = 128;
+                trace_injected_phase_transition(
+                    cfg,
+                    proxy_type,
+                    pkt.channel,
+                    display_type,
+                    prev_phase,
+                    state.phase,
+                    "media_start",
+                    state.session_id,
+                    state.ack_counter,
+                );
                 info!(
                     "{} <blue>injected media:</> START on channel <b>{:#04x}</> display={:?} session_id={} cfg_index={}",
                     get_name(proxy_type),
@@ -770,26 +1035,60 @@ fn emulate_injected_media_packet(
                     display_type
                 );
             }
-            rewrite_media_config_ready(pkt, max_unacked)?;
-            ctx.injected_media_counters.config_replies =
-                ctx.injected_media_counters.config_replies.saturating_add(1);
+            // Native sinks do not emit a control reply for START. Emitting CONFIG here
+            // can stall phone-side control flow right after injected startup.
             maybe_log_injected_media_counters(
                 proxy_type,
                 &ctx.injected_media_counters,
                 pkt.channel,
                 display_type,
             );
-            Ok(true)
+            Ok(false)
         }
         MEDIA_MESSAGE_DATA => {
+            if reassembled_frame.is_none() && (has_fragment_state || pkt.flags & FRAME_TYPE_MASK != (FRAME_TYPE_FIRST | FRAME_TYPE_LAST)) {
+                debug!(
+                    "{} <blue>injected media:</> fragment_wait on channel <b>{:#04x}</> display={:?} phase={}",
+                    get_name(proxy_type),
+                    pkt.channel,
+                    display_type,
+                    injected_phase_label(state.phase)
+                );
+                return Ok(false);
+            }
+
             ctx.injected_media_counters.data_seen =
                 ctx.injected_media_counters.data_seen.saturating_add(1);
-            // Keep sender unblocked by ACKing each media data packet.
-            if state.started && state.session_id != 0 {
+
+            if state.phase.can_stream() {
+                let prev_phase = state.phase;
+                state.phase = InjectedMediaPhase::Streaming;
                 state.ack_counter = state.ack_counter.saturating_add(1);
+                trace_injected_phase_transition(
+                    cfg,
+                    proxy_type,
+                    pkt.channel,
+                    display_type,
+                    prev_phase,
+                    state.phase,
+                    "media_data",
+                    state.session_id,
+                    state.ack_counter,
+                );
                 rewrite_media_ack(pkt, state.session_id, state.ack_counter)?;
                 ctx.injected_media_counters.ack_replies =
                     ctx.injected_media_counters.ack_replies.saturating_add(1);
+                if cfg.trace_channel_flow && (state.ack_counter == 1 || state.ack_counter % 32 == 0)
+                {
+                    info!(
+                        "{} <cyan>flow trace:</> injected ACK channel=<b>{:#04x}</> display={:?} session_id={} ack={}",
+                        get_name(proxy_type),
+                        pkt.channel,
+                        display_type,
+                        state.session_id,
+                        state.ack_counter
+                    );
+                }
                 if state.ack_counter == 1 || state.ack_counter % 256 == 0 {
                     info!(
                         "{} <blue>injected media:</> DATA ack on channel <b>{:#04x}</> display={:?} session_id={} ack={}",
@@ -808,11 +1107,13 @@ fn emulate_injected_media_packet(
                 );
                 return Ok(true);
             }
+
             warn!(
-                "{} <yellow>injected media:</> DATA before START/session on channel <b>{:#04x}</> display={:?}",
+                "{} <yellow>injected media:</> state_not_started on channel <b>{:#04x}</> display={:?} phase={}",
                 get_name(proxy_type),
                 pkt.channel,
-                display_type
+                display_type,
+                injected_phase_label(state.phase)
             );
             maybe_log_injected_media_counters(
                 proxy_type,
@@ -833,8 +1134,22 @@ fn emulate_injected_media_packet(
                 state.session_id,
                 state.ack_counter
             );
-            state.started = false;
+            let prev_phase = state.phase;
+            state.phase = InjectedMediaPhase::Idle;
             state.ack_counter = 0;
+            state.session_id = 0;
+            state.last_flags = pkt.flags;
+            trace_injected_phase_transition(
+                cfg,
+                proxy_type,
+                pkt.channel,
+                display_type,
+                prev_phase,
+                state.phase,
+                "media_stop",
+                state.session_id,
+                state.ack_counter,
+            );
             maybe_log_injected_media_counters(
                 proxy_type,
                 &ctx.injected_media_counters,
@@ -871,6 +1186,19 @@ fn emulate_injected_media_packet(
             );
 
             rewrite_video_focus_notification(pkt, requested_focus, false)?;
+            let prev_phase = state.phase;
+            state.phase = InjectedMediaPhase::FocusSent;
+            trace_injected_phase_transition(
+                cfg,
+                proxy_type,
+                pkt.channel,
+                display_type,
+                prev_phase,
+                state.phase,
+                "video_focus_request",
+                state.session_id,
+                state.ack_counter,
+            );
             ctx.injected_media_counters.focus_replies =
                 ctx.injected_media_counters.focus_replies.saturating_add(1);
             maybe_log_injected_media_counters(
@@ -1654,11 +1982,16 @@ pub async fn pkt_modify_hook(
         }
     }
 
-    if pkt.channel != 0 {
+    let control = protos::ControlMessageType::from_i32(message_id);
+    let control_allowed_on_service_channel = matches!(
+        control,
+        Some(MESSAGE_CHANNEL_OPEN_REQUEST | MESSAGE_CHANNEL_OPEN_RESPONSE)
+    );
+
+    if pkt.channel != 0 && !control_allowed_on_service_channel {
         return Ok(false);
     }
     // trying to obtain an Enum from message_id
-    let control = protos::ControlMessageType::from_i32(message_id);
     debug!(
         "message_id = {:04X}, {:?}, proxy_type: {:?}, flow: {:?}",
         message_id, control, proxy_type, flow
@@ -1673,7 +2006,15 @@ pub async fn pkt_modify_hook(
                 push_trace_id(&mut ctx.md_recent_control_from_md, control_id);
                 ctx.md_control_after_sdr = ctx.md_control_after_sdr.saturating_add(1);
                 ctx.md_last_control_after_sdr = Some(message_id);
-                if ctx.md_control_after_sdr <= 8 {
+                if cfg.trace_channel_flow {
+                    info!(
+                        "{} <cyan>flow trace:</> post-SDR control from phone msg_id=0x{:04X} {:?} count={}",
+                        get_name(proxy_type),
+                        message_id,
+                        control,
+                        ctx.md_control_after_sdr
+                    );
+                } else if ctx.md_control_after_sdr <= 8 {
                     info!(
                         "{} <blue>post-SDR phone control:</> msg_id=0x{:04X} {:?} count={}",
                         get_name(proxy_type),
@@ -1736,8 +2077,8 @@ pub async fn pkt_modify_hook(
             }
 
             // Populate media_channels (channel_id→sink) from the offset→sink map.
-            // Must run in MobileDevice context where the sinks are held —
-            // the SDR response from HU passes through proxy(MobileDevice).rxr first.
+            // Both MD and HU need this; for HU, we'll populate again after add_display_services
+            // to include injected services (cluster, etc).
             ctx.media_service_labels.clear();
             for svc in msg.services.iter() {
                 if let Some(label) = describe_media_service(svc) {
@@ -1745,18 +2086,19 @@ pub async fn pkt_modify_hook(
                 }
             }
 
-            if proxy_type == ProxyType::MobileDevice && !ctx.media_sinks.is_empty() {
+            if !ctx.media_sinks.is_empty() {
                 for svc in msg.services.iter() {
                     let ch = svc.id() as u8;
                     if !svc.media_sink_service.video_configs.is_empty() {
                         let offset = svc.media_sink_service.display_type().value() as u8;
                         if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
-                            sink.set_video_stream_info(
-                                svc.media_sink_service.available_type(),
-                                svc.media_sink_service.display_type(),
-                            )
-                            .await;
                             ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
                             info!(
                                 "{} <blue>media tap:</> video channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
                                 get_name(proxy_type),
@@ -1779,13 +2121,13 @@ pub async fn pkt_modify_hook(
                                     bits: acfg.number_of_bits(),
                                 }
                             });
-                            sink.set_audio_stream_info(
-                                svc.media_sink_service.available_type(),
-                                svc.media_sink_service.audio_type(),
-                                audio_config,
-                            )
-                            .await;
                             ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
                             if let Some(acfg) = audio_config {
                                 info!(
                                     "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?}, {}Hz, {}ch, {}bit)",
@@ -2095,6 +2437,102 @@ pub async fn pkt_modify_hook(
                 );
             }
 
+            // Populate media_channels (channel_id→sink) from the offset→sink map.
+            // Do this after add_display_services so HU includes injected channels (e.g., cluster 0x08).
+            // Both proxy contexts use this for injected suppression/deferred focus evaluation.
+            debug!(
+                "{} SDR handling: media_sinks.len()={} media_channels.len()={}",
+                get_name(proxy_type),
+                ctx.media_sinks.len(),
+                ctx.media_channels.len()
+            );
+            ctx.media_service_labels.clear();
+            for svc in msg.services.iter() {
+                if let Some(label) = describe_media_service(svc) {
+                    ctx.media_service_labels.insert(svc.id() as u8, label);
+                }
+            }
+
+            if !ctx.media_sinks.is_empty() {
+                for svc in msg.services.iter() {
+                    let ch = svc.id() as u8;
+                    if !svc.media_sink_service.video_configs.is_empty() {
+                        let offset = svc.media_sink_service.display_type().value() as u8;
+                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
+                            sink.set_video_stream_info(
+                                svc.media_sink_service.available_type(),
+                                svc.media_sink_service.display_type(),
+                            )
+                            .await;
+                            ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
+                            info!(
+                                "{} <blue>media tap:</> video channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
+                                get_name(proxy_type),
+                                ch,
+                                offset,
+                                svc.media_sink_service.available_type(),
+                                svc.media_sink_service.display_type()
+                            );
+                        }
+                    } else if !svc.media_sink_service.audio_configs.is_empty()
+                        || svc.media_sink_service.audio_type.is_some()
+                    {
+                        // audio offset = audio_type value + 2 (offsets 0-2 reserved for video)
+                        let offset = svc.media_sink_service.audio_type().value() as u8 + 2;
+                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
+                            let audio_config = svc.media_sink_service.audio_configs.first().map(|acfg| {
+                                AudioStreamConfig {
+                                    sample_rate: acfg.sampling_rate(),
+                                    channels: acfg.number_of_channels(),
+                                    bits: acfg.number_of_bits(),
+                                }
+                            });
+                            sink.set_audio_stream_info(
+                                svc.media_sink_service.available_type(),
+                                svc.media_sink_service.audio_type(),
+                                audio_config,
+                            )
+                            .await;
+                            ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
+                            if let Some(acfg) = audio_config {
+                                info!(
+                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?}, {}Hz, {}ch, {}bit)",
+                                    get_name(proxy_type),
+                                    ch,
+                                    offset,
+                                    svc.media_sink_service.available_type(),
+                                    svc.media_sink_service.audio_type(),
+                                    acfg.sample_rate,
+                                    acfg.channels,
+                                    acfg.bits
+                                );
+                            } else {
+                                info!(
+                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
+                                    get_name(proxy_type),
+                                    ch,
+                                    offset,
+                                    svc.media_sink_service.available_type(),
+                                    svc.media_sink_service.audio_type()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             if log_enabled!(log::Level::Info) {
                 info!(
                     "{} <blue>SDR output:</> [{}]",
@@ -2233,12 +2671,21 @@ pub async fn pkt_modify_hook(
         }
         MESSAGE_AUDIO_FOCUS_REQUEST => {
             if let Ok(msg) = AudioFocusRequestNotification::parse_from_bytes(data) {
-                debug!(
-                    "{} <blue>AUDIO_FOCUS_REQUEST:</> flow={:?}, request={:?}",
-                    get_name(proxy_type),
-                    flow,
-                    msg.request()
-                );
+                if cfg.trace_channel_flow {
+                    info!(
+                        "{} <cyan>flow trace:</> AUDIO_FOCUS_REQUEST flow={:?} request={:?}",
+                        get_name(proxy_type),
+                        flow,
+                        msg.request()
+                    );
+                } else {
+                    debug!(
+                        "{} <blue>AUDIO_FOCUS_REQUEST:</> flow={:?}, request={:?}",
+                        get_name(proxy_type),
+                        flow,
+                        msg.request()
+                    );
+                }
 
                 if proxy_type == ProxyType::MobileDevice
                     && flow == PacketFlow::FromEndpoint
@@ -2281,13 +2728,23 @@ pub async fn pkt_modify_hook(
         }
         MESSAGE_PING_REQUEST => {
             if let Ok(msg) = PingRequest::parse_from_bytes(data) {
-                debug!(
-                    "{} <blue>PING_REQUEST:</> flow={:?}, timestamp={}, bug_report={}",
-                    get_name(proxy_type),
-                    flow,
-                    msg.timestamp(),
-                    msg.bug_report()
-                );
+                if cfg.trace_channel_flow {
+                    info!(
+                        "{} <cyan>flow trace:</> PING_REQUEST flow={:?} timestamp={} bug_report={}",
+                        get_name(proxy_type),
+                        flow,
+                        msg.timestamp(),
+                        msg.bug_report()
+                    );
+                } else {
+                    debug!(
+                        "{} <blue>PING_REQUEST:</> flow={:?}, timestamp={}, bug_report={}",
+                        get_name(proxy_type),
+                        flow,
+                        msg.timestamp(),
+                        msg.bug_report()
+                    );
+                }
                 if proxy_type == ProxyType::MobileDevice
                     && flow == PacketFlow::ToEndpoint
                     && ctx.md_sdr_forwarded
@@ -2299,12 +2756,21 @@ pub async fn pkt_modify_hook(
         }
         MESSAGE_PING_RESPONSE => {
             if let Ok(msg) = PingResponse::parse_from_bytes(data) {
-                debug!(
-                    "{} <blue>PING_RESPONSE:</> flow={:?}, timestamp={}",
-                    get_name(proxy_type),
-                    flow,
-                    msg.timestamp()
-                );
+                if cfg.trace_channel_flow {
+                    info!(
+                        "{} <cyan>flow trace:</> PING_RESPONSE flow={:?} timestamp={}",
+                        get_name(proxy_type),
+                        flow,
+                        msg.timestamp()
+                    );
+                } else {
+                    debug!(
+                        "{} <blue>PING_RESPONSE:</> flow={:?}, timestamp={}",
+                        get_name(proxy_type),
+                        flow,
+                        msg.timestamp()
+                    );
+                }
                 if proxy_type == ProxyType::MobileDevice
                     && flow == PacketFlow::FromEndpoint
                     && ctx.md_sdr_forwarded
@@ -2673,14 +3139,26 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                             get_name(proxy_type)
                         )
                     })?;
-            // waiting for MD reply
-            let pkt = recv_packet_with_timeout(
-                proxy_type,
-                "rxr",
-                "initial version response from MD endpoint",
-                &mut rxr,
-            )
-            .await?;
+            // waiting for MD reply, skipping stale encrypted packets (0x1703) left over from a
+            // prior session on the phone side — these are not meaningful to the HU which never
+            // participated in that old session, so we absorb them here in the MITM layer.
+            let pkt = loop {
+                let pkt = recv_packet_with_timeout(
+                    proxy_type,
+                    "rxr",
+                    "initial version response from MD endpoint",
+                    &mut rxr,
+                )
+                .await?;
+                if packet_message_id(&pkt) == Some(MESSAGE_VERSION_RESPONSE as u16) {
+                    break pkt;
+                }
+                warn!(
+                    "{} ignoring stale pre-handshake packet from phone (msg_id=0x{:04X}), waiting for VERSION_RESPONSE",
+                    get_name(proxy_type),
+                    packet_message_id(&pkt).unwrap_or(0),
+                );
+            };
             let _ = pkt_debug(
                 proxy_type,
                 HexdumpLevel::DecryptedInput, // the packet is not encrypted
@@ -2802,12 +3280,43 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 control_stats.rx_to_endpoint.note_ingress();
             }
 
+            debug_injected_probe(proxy_type, "rx", &pkt, &ctx);
+
+            if proxy_type == ProxyType::HeadUnit {
+                maybe_emit_pending_injected_focus(proxy_type, &mut ctx, &cfg, &tx)?;
+            }
+
             // Keep injected-only channels invisible to HU.
             if proxy_type == ProxyType::HeadUnit
                 && pkt.channel != 0
                 && ctx.injected_channels.contains(&pkt.channel)
             {
-                if emulate_injected_media_packet(proxy_type, &mut pkt, &mut ctx)? {
+                let had_fragment_state = ctx.media_fragments.contains_key(&pkt.channel);
+                let first_fragment_msg_id = first_fragment_message_id(&pkt);
+                let reassembled_frame = if first_fragment_msg_id == Some(MEDIA_MESSAGE_DATA.value() as u16)
+                    || had_fragment_state
+                {
+                    reassemble_media_packet(&mut ctx.media_fragments, &pkt)
+                } else {
+                    None
+                };
+
+                if let Some(frame_data) = reassembled_frame.as_ref() {
+                    if frame_data.len() >= 2 {
+                        if let Some(sink) = ctx.media_channels.get(&pkt.channel).cloned() {
+                            tap_media_message(ProxyType::MobileDevice, &pkt, &sink, frame_data).await;
+                        }
+                    }
+                }
+
+                if emulate_injected_media_packet(
+                    proxy_type,
+                    &mut pkt,
+                    &mut ctx,
+                    reassembled_frame.as_deref(),
+                    had_fragment_state,
+                    &cfg,
+                )? {
                     debug!(
                         "{} synthesized injected media reply on channel <b>{:#04x}</>",
                         get_name(proxy_type),
@@ -2815,6 +3324,9 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                     );
                     let queue_started = Instant::now();
                     tx.send(pkt).await?;
+
+                    maybe_emit_pending_injected_focus(proxy_type, &mut ctx, &cfg, &tx)?;
+
                     if is_control {
                         control_stats.rx_to_endpoint.note_egress();
                         control_stats
@@ -2977,6 +3489,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
             let _ = pkt_debug(proxy_type, HexdumpLevel::RawInput, hex_requested, &pkt).await;
             match pkt.decrypt_payload(&mut mem_buf, &mut server).await {
                 Ok(_) => {
+                    debug_injected_probe(proxy_type, "rxr", &pkt, &ctx);
                     let _ = pkt_modify_hook(
                         proxy_type,
                         PacketFlow::FromEndpoint,
@@ -3144,7 +3657,7 @@ mod tests {
     }
 
     #[test]
-    fn add_display_services_adds_cluster_media_only() {
+    fn add_display_services_adds_cluster_media_and_input_when_opted_in() {
         let mut cfg = AppConfig::default();
         cfg.mitm = true;
         cfg.inject_display_types = crate::config_types::InjectDisplayTypes(Some(vec![
@@ -3158,9 +3671,9 @@ mod tests {
 
         let added = add_display_services(&mut msg, &cfg);
 
-        assert_eq!(added, 1);
+        assert_eq!(added, 2);
         assert!(has_video_display(&msg, DisplayType::DISPLAY_TYPE_CLUSTER));
-        assert!(!has_input_display(&msg, cfg.inject_cluster_display_id.into()));
+        assert!(has_input_display(&msg, cfg.inject_cluster_display_id.into()));
     }
 
     #[test]
@@ -3251,7 +3764,15 @@ mod tests {
         payload.insert(1, ((MEDIA_MESSAGE_SETUP as u16) & 0xff) as u8);
         let mut pkt = test_packet(0x2A, ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST, None, &payload);
 
-        assert!(emulate_injected_media_packet(ProxyType::HeadUnit, &mut pkt, &mut ctx).unwrap());
+        assert!(emulate_injected_media_packet(
+            ProxyType::HeadUnit,
+            &mut pkt,
+            &mut ctx,
+            None,
+            false,
+            &AppConfig::default(),
+        )
+        .unwrap());
 
         let msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]) as i32;
         assert_eq!(msg_id, MEDIA_MESSAGE_CONFIG.value());
@@ -3264,6 +3785,10 @@ mod tests {
     fn injected_media_data_after_start_is_rewritten_to_ack() {
         let mut ctx = test_ctx();
         ctx.injected_channels.insert(0x2A);
+        ctx.injected_media_display
+            .insert(0x2A, DisplayType::DISPLAY_TYPE_CLUSTER);
+        ctx.injected_media_state
+            .insert(0x2A, InjectedMediaState::default());
 
         let mut start = Start::new();
         start.set_session_id(7);
@@ -3274,7 +3799,15 @@ mod tests {
         let mut start_pkt =
             test_packet(0x2A, ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST, None, &start_payload);
 
-        assert!(emulate_injected_media_packet(ProxyType::HeadUnit, &mut start_pkt, &mut ctx).unwrap());
+        assert!(!emulate_injected_media_packet(
+            ProxyType::HeadUnit,
+            &mut start_pkt,
+            &mut ctx,
+            None,
+            false,
+            &AppConfig::default(),
+        )
+        .unwrap());
 
         let data_payload = vec![
             ((MEDIA_MESSAGE_DATA as u16) >> 8) as u8,
@@ -3285,13 +3818,123 @@ mod tests {
         let mut data_pkt =
             test_packet(0x2A, ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST, None, &data_payload);
 
-        assert!(emulate_injected_media_packet(ProxyType::HeadUnit, &mut data_pkt, &mut ctx).unwrap());
+        assert!(emulate_injected_media_packet(
+            ProxyType::HeadUnit,
+            &mut data_pkt,
+            &mut ctx,
+            Some(&data_payload),
+            false,
+            &AppConfig::default(),
+        )
+        .unwrap());
 
         let msg_id = u16::from_be_bytes([data_pkt.payload[0], data_pkt.payload[1]]) as i32;
         assert_eq!(msg_id, MEDIA_MESSAGE_ACK.value());
         let ack = Ack::parse_from_bytes(&data_pkt.payload[2..]).unwrap();
         assert_eq!(ack.session_id(), 7);
         assert_eq!(ack.ack(), 1);
+    }
+
+    #[test]
+    fn fragmented_injected_media_data_waits_for_reassembly_before_ack() {
+        let mut ctx = test_ctx();
+        ctx.injected_channels.insert(0x2A);
+        ctx.injected_media_display
+            .insert(0x2A, DisplayType::DISPLAY_TYPE_CLUSTER);
+
+        let mut start = Start::new();
+        start.set_session_id(11);
+        start.set_configuration_index(0);
+        let mut start_payload = start.write_to_bytes().unwrap();
+        start_payload.insert(0, ((MEDIA_MESSAGE_START as u16) >> 8) as u8);
+        start_payload.insert(1, ((MEDIA_MESSAGE_START as u16) & 0xff) as u8);
+        let mut start_pkt =
+            test_packet(0x2A, ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST, None, &start_payload);
+        assert!(!emulate_injected_media_packet(
+            ProxyType::HeadUnit,
+            &mut start_pkt,
+            &mut ctx,
+            None,
+            false,
+            &AppConfig::default(),
+        )
+        .unwrap());
+
+        let full_frame = vec![
+            ((MEDIA_MESSAGE_DATA as u16) >> 8) as u8,
+            ((MEDIA_MESSAGE_DATA as u16) & 0xff) as u8,
+            0xAA,
+            0xBB,
+            0xCC,
+            0xDD,
+        ];
+        let mut first_pkt = test_packet(
+            0x2A,
+            ENCRYPTED | FRAME_TYPE_FIRST,
+            Some(full_frame.len() as u32),
+            &full_frame[..4],
+        );
+        let first_frame = reassemble_media_packet(&mut ctx.media_fragments, &first_pkt);
+        assert!(!emulate_injected_media_packet(
+            ProxyType::HeadUnit,
+            &mut first_pkt,
+            &mut ctx,
+            first_frame.as_deref(),
+            false,
+            &AppConfig::default(),
+        )
+        .unwrap());
+
+        let mut last_pkt = test_packet(
+            0x2A,
+            ENCRYPTED | FRAME_TYPE_LAST,
+            None,
+            &full_frame[4..],
+        );
+        let last_frame = reassemble_media_packet(&mut ctx.media_fragments, &last_pkt);
+        assert!(emulate_injected_media_packet(
+            ProxyType::HeadUnit,
+            &mut last_pkt,
+            &mut ctx,
+            last_frame.as_deref(),
+            true,
+            &AppConfig::default(),
+        )
+        .unwrap());
+
+        let msg_id = u16::from_be_bytes([last_pkt.payload[0], last_pkt.payload[1]]) as i32;
+        assert_eq!(msg_id, MEDIA_MESSAGE_ACK.value());
+        let ack = Ack::parse_from_bytes(&last_pkt.payload[2..]).unwrap();
+        assert_eq!(ack.session_id(), 11);
+        assert_eq!(ack.ack(), 1);
+    }
+
+    #[test]
+    fn deferred_injected_focus_does_not_block_when_queue_is_full() {
+        let mut ctx = test_ctx();
+        ctx.injected_media_state.insert(
+            0x2A,
+            InjectedMediaState {
+                phase: InjectedMediaPhase::SetupSeen,
+                last_flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                ..Default::default()
+            },
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.inject_force_focus_without_tap = true;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(test_packet(0, 0, None, &[])).unwrap();
+
+        maybe_emit_pending_injected_focus(ProxyType::HeadUnit, &mut ctx, &cfg, &tx).unwrap();
+
+        assert!(ctx
+            .injected_media_state
+            .get(&0x2A)
+            .is_some_and(|state| state.phase == InjectedMediaPhase::SetupSeen));
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -3308,7 +3951,15 @@ mod tests {
         let mut pkt =
             test_packet(0x2B, ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST, None, &payload);
 
-        assert!(emulate_injected_media_packet(ProxyType::HeadUnit, &mut pkt, &mut ctx).unwrap());
+        assert!(emulate_injected_media_packet(
+            ProxyType::HeadUnit,
+            &mut pkt,
+            &mut ctx,
+            None,
+            false,
+            &AppConfig::default(),
+        )
+        .unwrap());
 
         let cfg = protos::Config::parse_from_bytes(&pkt.payload[2..]).unwrap();
         assert_eq!(cfg.max_unacked(), 2);

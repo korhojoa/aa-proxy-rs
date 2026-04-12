@@ -73,13 +73,19 @@ struct Args {
     #[clap(short, long)]
     generate_system_config: bool,
     /// Generate hostapd config and exit
-    #[clap(short='o', long)]
+    #[clap(short = 'o', long)]
     generate_hostapd: bool,
     /// Disconnect cleanly after this many seconds of active session (0 = disabled).
     /// Sends a ByeByeRequest to the phone then exits. Use instead of `timeout N aa-proxy-rs`
     /// in test scripts for a protocol-clean teardown.
     #[clap(short = 'T', long, default_value = "0")]
     session_timeout: u16,
+
+    /// Exit if no session starts within this many seconds after process startup (0 = disabled).
+    /// This is separate from `--session-timeout`, which only starts counting after a session
+    /// is established.
+    #[clap(short = 'C', long, default_value = "0")]
+    connection_start_timeout: u16,
 }
 
 fn init_wifi_config(cfg: &AppConfig) -> WifiConfig {
@@ -242,6 +248,7 @@ async fn tokio_main(
     led_support: bool,
     button_support: bool,
     profile_connected: Arc<AtomicBool>,
+    connection_start_timeout: u16,
     session_timeout: u16,
     session_started: Arc<Notify>,
 ) -> Result<()> {
@@ -305,11 +312,35 @@ async fn tokio_main(
     if session_timeout > 0 {
         let tx_timer = tx.clone();
         let config_timer = config.clone();
+        let session_started_timer = session_started.clone();
         tokio::spawn(async move {
-            session_started.notified().await;
-            info!("{} ⏱️ session timeout: {} seconds started", NAME, session_timeout);
+            session_started_timer.notified().await;
+            info!(
+                "{} ⏱️ session timeout: {} seconds started",
+                NAME, session_timeout
+            );
             tokio::time::sleep(std::time::Duration::from_secs(session_timeout.into())).await;
             clean_disconnect_and_exit(tx_timer, config_timer, "session timeout").await;
+        });
+    }
+
+    if connection_start_timeout > 0 {
+        let tx_timer = tx.clone();
+        let config_timer = config.clone();
+        let session_started_timer = session_started.clone();
+        tokio::spawn(async move {
+            info!(
+                "{} ⏱️ connection-start timeout: {} seconds started",
+                NAME, connection_start_timeout
+            );
+            tokio::select! {
+                _ = session_started_timer.notified() => {
+                    info!("{} ⏱️ connection-start timeout cancelled: session started", NAME);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(connection_start_timeout.into())) => {
+                    clean_disconnect_and_exit(tx_timer, config_timer, "connection-start timeout").await;
+                }
+            }
         });
     }
 
@@ -678,8 +709,8 @@ fn main() -> Result<()> {
     let (restart_tx, _) = broadcast::channel(1);
     let tcp_start = Arc::new(Notify::new());
     let tcp_start_cloned = tcp_start.clone();
-        let session_started = Arc::new(Notify::new());
-        let session_started_cloned = session_started.clone();
+    let session_started = Arc::new(Notify::new());
+    let session_started_cloned = session_started.clone();
     let config = Arc::new(RwLock::new(config));
     let config_json = Arc::new(RwLock::new(config_json));
     let config_cloned = config.clone();
@@ -708,8 +739,9 @@ fn main() -> Result<()> {
             led_support,
             button_support,
             profile_connected_cloned,
-                    args.session_timeout,
-                    session_started_cloned,
+            args.connection_start_timeout,
+            args.session_timeout,
+            session_started_cloned,
         )
         .await
     });
