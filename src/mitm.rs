@@ -3301,14 +3301,9 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 && ctx.injected_channels.contains(&pkt.channel)
             {
                 let had_fragment_state = ctx.media_fragments.contains_key(&pkt.channel);
-                let first_fragment_msg_id = first_fragment_message_id(&pkt);
-                let reassembled_frame = if first_fragment_msg_id == Some(MEDIA_MESSAGE_DATA.value() as u16)
-                    || had_fragment_state
-                {
-                    reassemble_media_packet(&mut ctx.media_fragments, &pkt)
-                } else {
-                    None
-                };
+                // Keep injected-channel tap behavior aligned with native tap behavior:
+                // reassemble all complete media packets so CODEC_CONFIG reaches tap clients.
+                let reassembled_frame = reassemble_media_packet(&mut ctx.media_fragments, &pkt);
 
                 if let Some(frame_data) = reassembled_frame.as_ref() {
                     if frame_data.len() >= 2 {
