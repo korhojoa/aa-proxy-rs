@@ -1,6 +1,7 @@
 use crate::mitm;
 use crate::mitm::protos::DisplayType;
 use crate::mitm::protos::EvConnectorType;
+use crate::mitm::protos::VideoCodecResolutionType;
 use bluer::Address;
 use serde::{
     de::{self, Visitor},
@@ -108,6 +109,33 @@ impl std::str::FromStr for DisplayType {
     }
 }
 
+fn parse_video_codec_resolution_token(token: &str) -> Option<VideoCodecResolutionType> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "800x480" => Some(VideoCodecResolutionType::VIDEO_800x480),
+        "1280x720" | "720p" => Some(VideoCodecResolutionType::VIDEO_1280x720),
+        "1920x1080" | "1080p" => Some(VideoCodecResolutionType::VIDEO_1920x1080),
+        "2560x1440" | "1440p" => Some(VideoCodecResolutionType::VIDEO_2560x1440),
+        "3840x2160" | "2160p" | "4k" => Some(VideoCodecResolutionType::VIDEO_3840x2160),
+        "720x1280" => Some(VideoCodecResolutionType::VIDEO_720x1280),
+        "1080x1920" => Some(VideoCodecResolutionType::VIDEO_1080x1920),
+        "1440x2560" => Some(VideoCodecResolutionType::VIDEO_1440x2560),
+        "2160x3840" => Some(VideoCodecResolutionType::VIDEO_2160x3840),
+        _ => None,
+    }
+}
+
+impl std::str::FromStr for VideoCodecResolutionType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_video_codec_resolution_token(s)
+            .or_else(|| {
+                <mitm::protos::VideoCodecResolutionType as protobuf::Enum>::from_str(s.trim())
+            })
+            .ok_or_else(|| format!("Unknown video codec resolution type: {}", s))
+    }
+}
+
 impl fmt::Display for DisplayType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -117,6 +145,49 @@ impl fmt::Display for DisplayType {
 impl fmt::Display for EvConnectorType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Display for VideoCodecResolutionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectClusterCodecResolution(pub VideoCodecResolutionType);
+
+impl Default for InjectClusterCodecResolution {
+    fn default() -> Self {
+        Self(VideoCodecResolutionType::VIDEO_800x480)
+    }
+}
+
+impl<'de> Deserialize<'de> for InjectClusterCodecResolution {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let resolution = s
+            .parse::<VideoCodecResolutionType>()
+            .map_err(de::Error::custom)?;
+        Ok(Self(resolution))
+    }
+}
+
+impl Serialize for InjectClusterCodecResolution {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl fmt::Display for InjectClusterCodecResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -335,5 +406,20 @@ mod tests {
             serialized,
             "\"DISPLAY_TYPE_CLUSTER,DISPLAY_TYPE_AUXILIARY\""
         );
+    }
+
+    #[test]
+    fn inject_cluster_codec_resolution_accepts_aliases() {
+        let parsed: InjectClusterCodecResolution =
+            serde_json::from_str("\"1280x720\"").expect("valid resolution alias");
+        assert_eq!(parsed.0, VideoCodecResolutionType::VIDEO_1280x720);
+    }
+
+    #[test]
+    fn inject_cluster_codec_resolution_serializes_to_enum_name() {
+        let value = InjectClusterCodecResolution(VideoCodecResolutionType::VIDEO_1920x1080);
+        let serialized =
+            serde_json::to_string(&value).expect("serialize inject cluster codec resolution");
+        assert_eq!(serialized, "\"VIDEO_1920x1080\"");
     }
 }

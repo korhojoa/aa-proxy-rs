@@ -1,5 +1,6 @@
 use crate::config_types::{
-    BluetoothAddressList, EvConnectorTypes, HexdumpLevel, InjectDisplayTypes, UsbId,
+    BluetoothAddressList, EvConnectorTypes, HexdumpLevel, InjectClusterCodecResolution,
+    InjectDisplayTypes, UsbId,
 };
 use indexmap::IndexMap;
 use serde::de::{Deserializer, Error as DeError};
@@ -127,6 +128,7 @@ pub struct AppConfig {
     pub inject_cluster_height_margin: u16,
     pub inject_cluster_density: u16,
     pub inject_cluster_viewing_distance: u16,
+    pub inject_cluster_codec_resolution: InjectClusterCodecResolution,
     pub inject_cluster_touch_width: u16,
     pub inject_cluster_touch_height: u16,
     pub inject_aux_display_id: u16,
@@ -294,6 +296,7 @@ impl Default for AppConfig {
             inject_cluster_height_margin: 344,
             inject_cluster_density: 180,
             inject_cluster_viewing_distance: 100,
+            inject_cluster_codec_resolution: InjectClusterCodecResolution::default(),
             inject_cluster_touch_width: 1280,
             inject_cluster_touch_height: 720,
             inject_aux_display_id: 2,
@@ -414,6 +417,8 @@ impl AppConfig {
         doc["inject_cluster_height_margin"] = value(self.inject_cluster_height_margin as i64);
         doc["inject_cluster_density"] = value(self.inject_cluster_density as i64);
         doc["inject_cluster_viewing_distance"] = value(self.inject_cluster_viewing_distance as i64);
+        doc["inject_cluster_codec_resolution"] =
+            value(self.inject_cluster_codec_resolution.to_string());
         doc["inject_cluster_touch_width"] = value(self.inject_cluster_touch_width as i64);
         doc["inject_cluster_touch_height"] = value(self.inject_cluster_touch_height as i64);
         doc["inject_aux_display_id"] = value(self.inject_aux_display_id as i64);

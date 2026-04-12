@@ -214,6 +214,7 @@ pub enum PacketFlow {
 struct DisplayProfile {
     display_type: DisplayType,
     display_id: u32,
+    codec_resolution: VideoCodecResolutionType,
     width_margin: u32,
     height_margin: u32,
     density: u32,
@@ -233,6 +234,7 @@ fn display_profiles(cfg: &AppConfig) -> Vec<DisplayProfile> {
             DisplayType::DISPLAY_TYPE_CLUSTER => profiles.push(DisplayProfile {
                 display_type: DisplayType::DISPLAY_TYPE_CLUSTER,
                 display_id: cfg.inject_cluster_display_id.into(),
+                codec_resolution: cfg.inject_cluster_codec_resolution.0,
                 width_margin: cfg.inject_cluster_width_margin.into(),
                 height_margin: cfg.inject_cluster_height_margin.into(),
                 density: if cfg.dpi > 0 {
@@ -247,6 +249,7 @@ fn display_profiles(cfg: &AppConfig) -> Vec<DisplayProfile> {
             DisplayType::DISPLAY_TYPE_AUXILIARY => profiles.push(DisplayProfile {
                 display_type: DisplayType::DISPLAY_TYPE_AUXILIARY,
                 display_id: cfg.inject_aux_display_id.into(),
+                codec_resolution: VideoCodecResolutionType::VIDEO_1280x720,
                 width_margin: cfg.inject_aux_width_margin.into(),
                 height_margin: cfg.inject_aux_height_margin.into(),
                 density: if cfg.dpi > 0 {
@@ -298,7 +301,7 @@ fn create_media_sink_service(id: i32, profile: DisplayProfile) -> Service {
     ui_config.set_ui_theme(UiTheme::UI_THEME_AUTOMATIC);
 
     let mut video_cfg = VideoConfiguration::new();
-    video_cfg.set_codec_resolution(VideoCodecResolutionType::VIDEO_1280x720);
+    video_cfg.set_codec_resolution(profile.codec_resolution);
     video_cfg.set_frame_rate(VideoFrameRateType::VIDEO_FPS_30);
     video_cfg.set_width_margin(profile.width_margin);
     video_cfg.set_height_margin(profile.height_margin);
@@ -3301,17 +3304,9 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 && ctx.injected_channels.contains(&pkt.channel)
             {
                 let had_fragment_state = ctx.media_fragments.contains_key(&pkt.channel);
-                // Keep injected-channel tap behavior aligned with native tap behavior:
-                // reassemble all complete media packets so CODEC_CONFIG reaches tap clients.
+                // Injected media packets were already tapped on the MobileDevice ingress path.
+                // Reassemble here only so ACK synthesis can track whole media messages.
                 let reassembled_frame = reassemble_media_packet(&mut ctx.media_fragments, &pkt);
-
-                if let Some(frame_data) = reassembled_frame.as_ref() {
-                    if frame_data.len() >= 2 {
-                        if let Some(sink) = ctx.media_channels.get(&pkt.channel).cloned() {
-                            tap_media_message(ProxyType::MobileDevice, &pkt, &sink, frame_data).await;
-                        }
-                    }
-                }
 
                 if emulate_injected_media_packet(
                     proxy_type,

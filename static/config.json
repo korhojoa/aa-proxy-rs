@@ -223,6 +223,21 @@
           "typ": "integer",
           "description": "Cluster viewing distance for injected display service."
         },
+        "inject_cluster_codec_resolution": {
+          "typ": "select",
+          "description": "Cluster video codec resolution enum for injected display service.",
+          "values": [
+            "VIDEO_800x480",
+            "VIDEO_1280x720",
+            "VIDEO_1920x1080",
+            "VIDEO_2560x1440",
+            "VIDEO_3840x2160",
+            "VIDEO_720x1280",
+            "VIDEO_1080x1920",
+            "VIDEO_1440x2560",
+            "VIDEO_2160x3840"
+          ]
+        },
         "inject_cluster_touch_width": {
           "typ": "integer",
           "description": "Cluster input touchscreen width when `inject_add_input_sources` is enabled."
