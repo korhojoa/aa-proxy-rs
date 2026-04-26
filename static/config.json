@@ -197,11 +197,11 @@
         },
         "inject_display_types": {
           "typ": "string",
-          "description": "Add video display services to the `service discovery response`. Possible values (comma separated): `cluster`, `aux`. Leave empty to disable. Useful when forcing additional display channels for capture. Requires `mitm = true`."
+          "description": "Add video display services to the `service discovery response`. Possible values (comma separated): `cluster`, `aux`. Leave empty to disable. Useful when forcing additional display channels for capture. Requires `mitm = true`. For best hardware compatibility, start with video-only injection and leave `inject_add_input_sources` disabled."
         },
         "inject_add_input_sources": {
           "typ": "boolean",
-          "description": "When enabled, also inject matching `input_source_service` entries for configured display IDs. Disabled by default because HU-specific keycode sets may differ."
+          "description": "When enabled, also inject matching `input_source_service` entries for configured display IDs where supported. Disabled by default because HU-specific keycode sets may differ, and some head units behave better with video-only injected displays. Cluster input is intentionally not synthesized; auxiliary input injection remains supported."
         },
         "inject_cluster_display_id": {
           "typ": "integer",

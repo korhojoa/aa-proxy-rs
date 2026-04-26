@@ -213,8 +213,8 @@ async fn clean_disconnect_and_exit(
         info!("{} {}: no active session tx, skipping ByeBye", NAME, reason);
     }
 
-    // Trigger normal io_loop teardown (TCP shutdown + USB reset + context cleanup).
-    config.write().await.action_requested = Some(Action::Reconnect);
+    // Trigger session teardown without starting a fresh reconnect attempt.
+    config.write().await.action_requested = Some(Action::Stop);
 
     // Wait for io_loop cleanup to clear the active tx context, but don't hang forever.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -231,6 +231,10 @@ async fn clean_disconnect_and_exit(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // Give DHU a brief window to observe EOF after BYEBYE teardown before the
+    // process exits, without starting a reconnect cycle.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     info!("{} {}: exiting process after teardown", NAME, reason);
     std::process::exit(0);
@@ -484,7 +488,11 @@ async fn tokio_main(
             leds.set_led(LedColor::Blue, LedMode::On).await;
         }
         // wait for restart notification
-        let _ = need_restart.recv().await;
+        let action = need_restart.recv().await.ok().flatten();
+        if action == Some(Action::Stop) {
+            info!("{} 🛑 stop requested, not restarting connection loop", NAME);
+            break Ok(());
+        }
         if !(cfg.quick_reconnect && profile_connected.load(Ordering::Relaxed)) {
             info!(
                 "{} 📵 TCP/USB connection closed or not started, trying again...",

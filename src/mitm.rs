@@ -356,6 +356,10 @@ fn create_input_source_service(id: i32, profile: DisplayProfile) -> Service {
     service
 }
 
+fn should_inject_input_source(profile: DisplayProfile) -> bool {
+    profile.display_type != DisplayType::DISPLAY_TYPE_MAIN
+}
+
 fn add_display_services(msg: &mut ServiceDiscoveryResponse, cfg: &AppConfig) -> usize {
     if !cfg.mitm {
         return 0;
@@ -370,7 +374,10 @@ fn add_display_services(msg: &mut ServiceDiscoveryResponse, cfg: &AppConfig) -> 
             added += 1;
         }
 
-        if cfg.inject_add_input_sources && !has_input_display(msg, profile.display_id) {
+        if cfg.inject_add_input_sources
+            && should_inject_input_source(profile)
+            && !has_input_display(msg, profile.display_id)
+        {
             let id = next_service_id(msg);
             msg.services
                 .push(create_input_source_service(id, profile));
@@ -419,6 +426,130 @@ fn summarize_services(services: &[Service]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn refresh_media_service_labels(ctx: &mut ModifyContext, services: &[Service]) {
+    ctx.media_service_labels.clear();
+    for svc in services {
+        if let Some(label) = describe_media_service(svc) {
+            ctx.media_service_labels.insert(svc.id() as u8, label);
+        }
+    }
+}
+
+fn track_injected_display_services(ctx: &mut ModifyContext, services: &[Service]) -> Vec<i32> {
+    let mut newly_tracked = Vec::new();
+
+    for svc in services {
+        let sid = svc.id();
+        if ctx.hu_service_ids.contains(&sid) {
+            continue;
+        }
+
+        if ctx.injected_service_ids.insert(sid) {
+            newly_tracked.push(sid);
+        }
+
+        if !svc.media_sink_service.video_configs.is_empty() {
+            ctx.injected_media_display
+                .insert(sid as u8, svc.media_sink_service.display_type());
+        }
+    }
+
+    newly_tracked.sort_unstable();
+    newly_tracked
+}
+
+async fn register_media_channels_from_services(
+    proxy_type: ProxyType,
+    ctx: &mut ModifyContext,
+    services: &[Service],
+    update_stream_info: bool,
+) {
+    if ctx.media_sinks.is_empty() {
+        return;
+    }
+
+    for svc in services {
+        let ch = svc.id() as u8;
+        if !svc.media_sink_service.video_configs.is_empty() {
+            let offset = svc.media_sink_service.display_type().value() as u8;
+            if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
+                if update_stream_info {
+                    sink.set_video_stream_info(
+                        svc.media_sink_service.available_type(),
+                        svc.media_sink_service.display_type(),
+                    )
+                    .await;
+                }
+                ctx.media_channels.insert(ch, sink);
+                debug!(
+                    "{} media_channels.insert: ch={:#04x} offset={}",
+                    get_name(proxy_type),
+                    ch,
+                    offset
+                );
+                info!(
+                    "{} <blue>media tap:</> video channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
+                    get_name(proxy_type),
+                    ch,
+                    offset,
+                    svc.media_sink_service.available_type(),
+                    svc.media_sink_service.display_type()
+                );
+            }
+        } else if !svc.media_sink_service.audio_configs.is_empty()
+            || svc.media_sink_service.audio_type.is_some()
+        {
+            let offset = svc.media_sink_service.audio_type().value() as u8 + 2;
+            if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
+                let audio_config = svc.media_sink_service.audio_configs.first().map(|acfg| {
+                    AudioStreamConfig {
+                        sample_rate: acfg.sampling_rate(),
+                        channels: acfg.number_of_channels(),
+                        bits: acfg.number_of_bits(),
+                    }
+                });
+                if update_stream_info {
+                    sink.set_audio_stream_info(
+                        svc.media_sink_service.available_type(),
+                        svc.media_sink_service.audio_type(),
+                        audio_config,
+                    )
+                    .await;
+                }
+                ctx.media_channels.insert(ch, sink);
+                debug!(
+                    "{} media_channels.insert: ch={:#04x} offset={}",
+                    get_name(proxy_type),
+                    ch,
+                    offset
+                );
+                if let Some(acfg) = audio_config {
+                    info!(
+                        "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?}, {}Hz, {}ch, {}bit)",
+                        get_name(proxy_type),
+                        ch,
+                        offset,
+                        svc.media_sink_service.available_type(),
+                        svc.media_sink_service.audio_type(),
+                        acfg.sample_rate,
+                        acfg.channels,
+                        acfg.bits
+                    );
+                } else {
+                    info!(
+                        "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
+                        get_name(proxy_type),
+                        ch,
+                        offset,
+                        svc.media_sink_service.available_type(),
+                        svc.media_sink_service.audio_type()
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn bump_flow_counter(flow: PacketFlow, from_endpoint: &mut u64, to_endpoint: &mut u64) {
@@ -509,6 +640,307 @@ fn summarize_media_services(services: &[Service]) -> String {
         .filter_map(describe_media_service)
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn apply_sdr_service_capability_overrides(
+    proxy_type: ProxyType,
+    control: ControlMessageType,
+    cfg: &AppConfig,
+    msg: &mut ServiceDiscoveryResponse,
+) {
+    if cfg.dpi > 0 {
+        if let Some(svc) = msg
+            .services
+            .iter_mut()
+            .find(|svc| !svc.media_sink_service.video_configs.is_empty())
+        {
+            let prev_val = svc.media_sink_service.video_configs[0].density();
+            svc.media_sink_service.as_mut().unwrap().video_configs[0].set_density(cfg.dpi.into());
+            info!(
+                "{} <yellow>{:?}</>: replacing DPI value: from <b>{}</> to <b>{}</>",
+                get_name(proxy_type),
+                control,
+                prev_val,
+                cfg.dpi
+            );
+        }
+    }
+
+    if cfg.disable_tts_sink {
+        while let Some(svc) = msg.services.iter_mut().find(|svc| {
+            !svc.media_sink_service.audio_configs.is_empty()
+                && svc.media_sink_service.audio_type() == AUDIO_STREAM_GUIDANCE
+        }) {
+            svc.media_sink_service
+                .as_mut()
+                .unwrap()
+                .set_audio_type(AUDIO_STREAM_SYSTEM_AUDIO);
+        }
+        info!(
+            "{} <yellow>{:?}</>: TTS sink disabled",
+            get_name(proxy_type),
+            control,
+        );
+    }
+
+    if cfg.disable_media_sink {
+        msg.services
+            .retain(|svc| svc.media_sink_service.audio_type() != AUDIO_STREAM_MEDIA);
+        info!(
+            "{} <yellow>{:?}</>: media sink disabled",
+            get_name(proxy_type),
+            control,
+        );
+    }
+
+    if cfg.remove_tap_restriction {
+        if let Some(svc) = msg
+            .services
+            .iter_mut()
+            .find(|svc| !svc.sensor_source_service.sensors.is_empty())
+        {
+            svc.sensor_source_service
+                .as_mut()
+                .unwrap()
+                .sensors
+                .retain(|s| s.sensor_type() != SENSOR_SPEED);
+        }
+    }
+
+    if cfg.video_in_motion {
+        if let Some(svc) = msg
+            .services
+            .iter_mut()
+            .find(|svc| !svc.sensor_source_service.sensors.is_empty())
+        {
+            let sensors_to_strip = [
+                SENSOR_ACCELEROMETER_DATA,
+                SENSOR_GYROSCOPE_DATA,
+                SENSOR_DEAD_RECKONING_DATA,
+                SENSOR_SPEED,
+            ];
+            svc.sensor_source_service
+                .as_mut()
+                .unwrap()
+                .sensors
+                .retain(|s| !sensors_to_strip.contains(&s.sensor_type()));
+            svc.sensor_source_service
+                .as_mut()
+                .unwrap()
+                .set_location_characterization(256);
+
+            info!(
+                "{} <yellow>{:?}</> video_in_motion: stripped motion sensors from SDR, location_characterization=RAW_GPS_ONLY",
+                get_name(proxy_type),
+                control,
+            );
+        }
+    }
+
+    if cfg.developer_mode {
+        msg.set_make(DHU_MAKE.into());
+        msg.set_model(DHU_MODEL.into());
+        msg.set_head_unit_make(DHU_MAKE.into());
+        msg.set_head_unit_model(DHU_MODEL.into());
+        if let Some(info) = msg.headunit_info.as_mut() {
+            info.set_make(DHU_MAKE.into());
+            info.set_model(DHU_MODEL.into());
+            info.set_head_unit_make(DHU_MAKE.into());
+            info.set_head_unit_model(DHU_MODEL.into());
+        }
+        info!(
+            "{} <yellow>{:?}</>: enabling developer mode",
+            get_name(proxy_type),
+            control,
+        );
+    }
+
+    if cfg.remove_bluetooth {
+        msg.services.retain(|svc| svc.bluetooth_service.is_none());
+    }
+
+    if cfg.remove_wifi {
+        msg.services
+            .retain(|svc| svc.wifi_projection_service.is_none());
+    }
+
+    if cfg.ev {
+        if let Some(svc) = msg
+            .services
+            .iter_mut()
+            .find(|svc| !svc.sensor_source_service.sensors.is_empty())
+        {
+            info!(
+                "{} <yellow>{:?}</>: adding <b><green>EV</> features...",
+                get_name(proxy_type),
+                control,
+            );
+
+            let mut sensor = Sensor::new();
+            sensor.set_sensor_type(SENSOR_VEHICLE_ENERGY_MODEL_DATA);
+            svc.sensor_source_service
+                .as_mut()
+                .unwrap()
+                .sensors
+                .push(sensor);
+            svc.sensor_source_service
+                .as_mut()
+                .unwrap()
+                .supported_fuel_types = vec![FuelType::FUEL_TYPE_ELECTRIC.into()];
+
+            let connectors: Vec<EnumOrUnknown<EvConnectorType>> = match &cfg.ev_connector_types.0 {
+                Some(types) => types.iter().map(|&t| t.into()).collect(),
+                None => vec![EvConnectorType::EV_CONNECTOR_TYPE_MENNEKES.into()],
+            };
+            info!(
+                "{} <yellow>{:?}</>: EV connectors: {:?}",
+                get_name(proxy_type),
+                control,
+                connectors,
+            );
+            svc.sensor_source_service
+                .as_mut()
+                .unwrap()
+                .supported_ev_connector_types = connectors;
+        }
+    }
+}
+
+async fn cache_sdr_channels(
+    proxy_type: ProxyType,
+    ctx: &mut ModifyContext,
+    cfg: &AppConfig,
+    msg: &ServiceDiscoveryResponse,
+    sensor_channel: &Arc<tokio::sync::Mutex<Option<u8>>>,
+    input_channel: &Arc<tokio::sync::Mutex<Option<u8>>>,
+) {
+    if cfg.audio_max_unacked > 0 {
+        for svc in msg
+            .services
+            .iter()
+            .filter(|svc| !svc.media_sink_service.audio_configs.is_empty())
+        {
+            ctx.audio_channels.push(svc.id() as u8);
+        }
+        info!(
+            "{} <blue>media_sink_service:</> channels: <b>{:02x?}</>",
+            get_name(proxy_type),
+            ctx.audio_channels
+        );
+    }
+
+    if cfg.ev || cfg.video_in_motion {
+        if let Some(svc) = msg
+            .services
+            .iter()
+            .find(|svc| !svc.sensor_source_service.sensors.is_empty())
+        {
+            ctx.sensor_channel = Some(svc.id() as u8);
+            let mut sc_lock = sensor_channel.lock().await;
+            *sc_lock = Some(svc.id() as u8);
+
+            info!(
+                "{} <blue>sensor_source_service</> channel is: <b>{:#04x}</>",
+                get_name(proxy_type),
+                svc.id() as u8
+            );
+        }
+    }
+
+    if let Some(svc) = msg.services.iter().find(|svc| svc.input_source_service.is_some()) {
+        let mut ic_lock = input_channel.lock().await;
+        *ic_lock = Some(svc.id() as u8);
+
+        info!(
+            "{} <blue>input_source_service</> channel is: <b>{:#04x}</>",
+            get_name(proxy_type),
+            svc.id() as u8
+        );
+    }
+
+    if cfg.waze_lht_workaround {
+        if let Some(svc) = msg
+            .services
+            .iter()
+            .find(|svc| svc.navigation_status_service.is_some())
+        {
+            ctx.nav_channel = Some(svc.id() as u8);
+
+            info!(
+                "{} <blue>navigation_status_service</> channel is: <b>{:#04x}</>",
+                get_name(proxy_type),
+                svc.id() as u8
+            );
+        }
+    }
+}
+
+async fn apply_display_injection_and_refresh_media_maps(
+    proxy_type: ProxyType,
+    ctx: &mut ModifyContext,
+    cfg: &AppConfig,
+    control: ControlMessageType,
+    msg: &mut ServiceDiscoveryResponse,
+) {
+    let added_services = add_display_services(msg, cfg);
+    if added_services > 0 {
+        track_injected_display_services(ctx, &msg.services);
+        info!(
+            "{} <yellow>{:?}</>: injected <b>{}</> display service(s)",
+            get_name(proxy_type),
+            control,
+            added_services,
+        );
+        info!(
+            "{} <blue>injected service ids:</> <b>{:?}</>",
+            get_name(proxy_type),
+            ctx.injected_service_ids
+        );
+    }
+
+    debug!(
+        "{} SDR handling: media_sinks.len()={} media_channels.len()={}",
+        get_name(proxy_type),
+        ctx.media_sinks.len(),
+        ctx.media_channels.len()
+    );
+    refresh_media_service_labels(ctx, &msg.services);
+    register_media_channels_from_services(proxy_type, ctx, &msg.services, true).await;
+}
+
+fn maybe_synthesize_injected_channel_open_response(
+    proxy_type: ProxyType,
+    flow: PacketFlow,
+    ctx: &mut ModifyContext,
+    sid: i32,
+    pkt: &mut Packet,
+) -> Result<bool> {
+    if !ctx.injected_service_ids.contains(&sid) {
+        return Ok(false);
+    }
+
+    ctx.injected_open_seen += 1;
+
+    if proxy_type != ProxyType::HeadUnit || flow != PacketFlow::ToEndpoint {
+        return Ok(false);
+    }
+
+    ctx.injected_channels.insert(sid as u8);
+
+    let mut response = ChannelOpenResponse::new();
+    response.set_status(MessageStatus::STATUS_SUCCESS);
+    let mut payload = response.write_to_bytes()?;
+    payload.insert(0, ((MESSAGE_CHANNEL_OPEN_RESPONSE as u16) >> 8) as u8);
+    payload.insert(1, ((MESSAGE_CHANNEL_OPEN_RESPONSE as u16) & 0xff) as u8);
+    pkt.payload = payload;
+
+    info!(
+        "{} <yellow>transparency:</> synthesized CHANNEL_OPEN_RESPONSE for injected service_id <b>{}</>; HU path suppressed",
+        get_name(proxy_type),
+        sid
+    );
+
+    Ok(true)
 }
 
 fn media_channel_label(ctx: &ModifyContext, channel: u8) -> String {
@@ -943,45 +1375,6 @@ fn maybe_emit_pending_injected_focus(
 
         if has_tap_client || cfg.inject_force_focus_without_tap {
             ready_channels.push((channel, state.last_flags, has_tap_client));
-        }
-    }
-
-    // Reacquire projected focus on fresh cluster tap connections even if we do not
-    // currently have injected media runtime state for that channel.
-    for (&channel, &display_type) in &ctx.injected_media_display {
-        if display_type != DisplayType::DISPLAY_TYPE_CLUSTER {
-            continue;
-        }
-        if ctx.injected_media_state.contains_key(&channel) {
-            continue;
-        }
-
-        let Some(sink) = ctx.media_channels.get(&channel) else {
-            continue;
-        };
-
-        let has_tap_client = sink.has_subscribers();
-        let connect_gen = sink.client_connect_generation();
-        let seen_connect_gen = ctx
-            .injected_media_connect_gen
-            .get(&channel)
-            .copied()
-            .unwrap_or_default();
-        let new_connection = connect_gen > seen_connect_gen;
-
-        connect_gen_updates.push((channel, connect_gen));
-        tap_presence_updates.push((channel, has_tap_client));
-
-        if new_connection && has_tap_client {
-            debug!(
-                "{} deferred_focus check: ch={:#04x} phase=absent tap_client=true force={} media_channels_has_sink=true connect_gen={} seen_connect_gen={} new_connection=true",
-                get_name(proxy_type),
-                channel,
-                cfg.inject_force_focus_without_tap,
-                connect_gen,
-                seen_connect_gen,
-            );
-            toggle_channels.push((channel, ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST));
         }
     }
 
@@ -2316,81 +2709,8 @@ pub async fn pkt_modify_hook(
             // Populate media_channels (channel_id→sink) from the offset→sink map.
             // Both MD and HU need this; for HU, we'll populate again after add_display_services
             // to include injected services (cluster, etc).
-            ctx.media_service_labels.clear();
-            for svc in msg.services.iter() {
-                if let Some(label) = describe_media_service(svc) {
-                    ctx.media_service_labels.insert(svc.id() as u8, label);
-                }
-            }
-
-            if !ctx.media_sinks.is_empty() {
-                for svc in msg.services.iter() {
-                    let ch = svc.id() as u8;
-                    if !svc.media_sink_service.video_configs.is_empty() {
-                        let offset = svc.media_sink_service.display_type().value() as u8;
-                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
-                            ctx.media_channels.insert(ch, sink);
-                            debug!(
-                                "{} media_channels.insert: ch={:#04x} offset={}",
-                                get_name(proxy_type),
-                                ch,
-                                offset
-                            );
-                            info!(
-                                "{} <blue>media tap:</> video channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
-                                get_name(proxy_type),
-                                ch,
-                                offset,
-                                svc.media_sink_service.available_type(),
-                                svc.media_sink_service.display_type()
-                            );
-                        }
-                    } else if !svc.media_sink_service.audio_configs.is_empty()
-                        || svc.media_sink_service.audio_type.is_some()
-                    {
-                        // audio offset = audio_type value + 2 (offsets 0-2 reserved for video)
-                        let offset = svc.media_sink_service.audio_type().value() as u8 + 2;
-                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
-                            let audio_config = svc.media_sink_service.audio_configs.first().map(|acfg| {
-                                AudioStreamConfig {
-                                    sample_rate: acfg.sampling_rate(),
-                                    channels: acfg.number_of_channels(),
-                                    bits: acfg.number_of_bits(),
-                                }
-                            });
-                            ctx.media_channels.insert(ch, sink);
-                            debug!(
-                                "{} media_channels.insert: ch={:#04x} offset={}",
-                                get_name(proxy_type),
-                                ch,
-                                offset
-                            );
-                            if let Some(acfg) = audio_config {
-                                info!(
-                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?}, {}Hz, {}ch, {}bit)",
-                                    get_name(proxy_type),
-                                    ch,
-                                    offset,
-                                    svc.media_sink_service.available_type(),
-                                    svc.media_sink_service.audio_type(),
-                                    acfg.sample_rate,
-                                    acfg.channels,
-                                    acfg.bits
-                                );
-                            } else {
-                                info!(
-                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
-                                    get_name(proxy_type),
-                                    ch,
-                                    offset,
-                                    svc.media_sink_service.available_type(),
-                                    svc.media_sink_service.audio_type()
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            refresh_media_service_labels(ctx, &msg.services);
+            register_media_channels_from_services(proxy_type, ctx, &msg.services, false).await;
 
             // SDR rewriting is HeadUnit-only; MobileDevice sees SDR read-only (for channel map above)
             if proxy_type == ProxyType::MobileDevice {
@@ -2398,377 +2718,25 @@ pub async fn pkt_modify_hook(
                 return Ok(false);
             }
 
-            // DPI
-            if cfg.dpi > 0 {
-                if let Some(svc) = msg
-                    .services
-                    .iter_mut()
-                    .find(|svc| !svc.media_sink_service.video_configs.is_empty())
-                {
-                    // get previous/original value
-                    let prev_val = svc.media_sink_service.video_configs[0].density();
-                    // set new value
-                    svc.media_sink_service.as_mut().unwrap().video_configs[0]
-                        .set_density(cfg.dpi.into());
-                    info!(
-                        "{} <yellow>{:?}</>: replacing DPI value: from <b>{}</> to <b>{}</>",
-                        get_name(proxy_type),
-                        control.unwrap(),
-                        prev_val,
-                        cfg.dpi
-                    );
-                }
-            }
+            apply_sdr_service_capability_overrides(proxy_type, control.unwrap(), cfg, &mut msg);
+            cache_sdr_channels(
+                proxy_type,
+                ctx,
+                cfg,
+                &msg,
+                &sensor_channel,
+                &input_channel,
+            )
+            .await;
 
-            // disable tts sink
-            if cfg.disable_tts_sink {
-                while let Some(svc) = msg.services.iter_mut().find(|svc| {
-                    !svc.media_sink_service.audio_configs.is_empty()
-                        && svc.media_sink_service.audio_type() == AUDIO_STREAM_GUIDANCE
-                }) {
-                    svc.media_sink_service
-                        .as_mut()
-                        .unwrap()
-                        .set_audio_type(AUDIO_STREAM_SYSTEM_AUDIO);
-                }
-                info!(
-                    "{} <yellow>{:?}</>: TTS sink disabled",
-                    get_name(proxy_type),
-                    control.unwrap(),
-                );
-            }
-
-            // disable media sink
-            if cfg.disable_media_sink {
-                msg.services
-                    .retain(|svc| svc.media_sink_service.audio_type() != AUDIO_STREAM_MEDIA);
-                info!(
-                    "{} <yellow>{:?}</>: media sink disabled",
-                    get_name(proxy_type),
-                    control.unwrap(),
-                );
-            }
-
-            // save all audio sink channels in context
-            if cfg.audio_max_unacked > 0 {
-                for svc in msg
-                    .services
-                    .iter()
-                    .filter(|svc| !svc.media_sink_service.audio_configs.is_empty())
-                {
-                    ctx.audio_channels.push(svc.id() as u8);
-                }
-                info!(
-                    "{} <blue>media_sink_service:</> channels: <b>{:02x?}</>",
-                    get_name(proxy_type),
-                    ctx.audio_channels
-                );
-            }
-
-            // save sensor channel in context
-            if cfg.ev || cfg.video_in_motion {
-                if let Some(svc) = msg
-                    .services
-                    .iter()
-                    .find(|svc| !svc.sensor_source_service.sensors.is_empty())
-                {
-                    // set in local context
-                    ctx.sensor_channel = Some(svc.id() as u8);
-                    // set in REST server context for remote EV requests
-                    let mut sc_lock = sensor_channel.lock().await;
-                    *sc_lock = Some(svc.id() as u8);
-
-                    info!(
-                        "{} <blue>sensor_source_service</> channel is: <b>{:#04x}</>",
-                        get_name(proxy_type),
-                        svc.id() as u8
-                    );
-                }
-            }
-
-            // save input channel in REST server context for remote key requests
-            if let Some(svc) = msg.services.iter().find(|svc| svc.input_source_service.is_some()) {
-                let mut ic_lock = input_channel.lock().await;
-                *ic_lock = Some(svc.id() as u8);
-
-                info!(
-                    "{} <blue>input_source_service</> channel is: <b>{:#04x}</>",
-                    get_name(proxy_type),
-                    svc.id() as u8
-                );
-            }
-
-            // save navigation channel in context
-            if cfg.waze_lht_workaround {
-                if let Some(svc) = msg
-                    .services
-                    .iter()
-                    .find(|svc| svc.navigation_status_service.is_some())
-                {
-                    // set in local context
-                    ctx.nav_channel = Some(svc.id() as u8);
-
-                    info!(
-                        "{} <blue>navigation_status_service</> channel is: <b>{:#04x}</>",
-                        get_name(proxy_type),
-                        svc.id() as u8
-                    );
-                }
-            }
-
-            // remove tap restriction by removing SENSOR_SPEED
-            if cfg.remove_tap_restriction {
-                if let Some(svc) = msg
-                    .services
-                    .iter_mut()
-                    .find(|svc| !svc.sensor_source_service.sensors.is_empty())
-                {
-                    svc.sensor_source_service
-                        .as_mut()
-                        .unwrap()
-                        .sensors
-                        .retain(|s| s.sensor_type() != SENSOR_SPEED);
-                }
-            }
-
-            // video_in_motion: strip motion-related sensors from SDR capabilities
-            // and downgrade location_characterization so AA cannot cross-validate
-            if cfg.video_in_motion {
-                if let Some(svc) = msg
-                    .services
-                    .iter_mut()
-                    .find(|svc| !svc.sensor_source_service.sensors.is_empty())
-                {
-                    // Remove sensor types that reveal vehicle motion.
-                    // Keep DRIVING_STATUS, GEAR, PARKING_BRAKE, LOCATION (we spoof those)
-                    // but remove the ones that are harder to spoof consistently per-HU.
-                    let sensors_to_strip = [
-                        SENSOR_ACCELEROMETER_DATA,
-                        SENSOR_GYROSCOPE_DATA,
-                        SENSOR_DEAD_RECKONING_DATA,
-                        SENSOR_SPEED,
-                    ];
-                    svc.sensor_source_service
-                        .as_mut()
-                        .unwrap()
-                        .sensors
-                        .retain(|s| !sensors_to_strip.contains(&s.sensor_type()));
-
-                    // Reset location_characterization to RAW_GPS_ONLY (256).
-                    // This tells AA the HU does NOT fuse wheel speed, gyroscope,
-                    // accelerometer, or dead reckoning into position fixes, so AA
-                    // will not expect those signals for cross-validation.
-                    svc.sensor_source_service
-                        .as_mut()
-                        .unwrap()
-                        .set_location_characterization(256); // RAW_GPS_ONLY
-
-                    info!(
-                        "{} <yellow>{:?}</> video_in_motion: stripped motion sensors from SDR, location_characterization=RAW_GPS_ONLY",
-                        get_name(proxy_type),
-                        control.unwrap(),
-                    );
-                }
-            }
-
-            // enabling developer mode
-            if cfg.developer_mode {
-                msg.set_make(DHU_MAKE.into());
-                msg.set_model(DHU_MODEL.into());
-                msg.set_head_unit_make(DHU_MAKE.into());
-                msg.set_head_unit_model(DHU_MODEL.into());
-                if let Some(info) = msg.headunit_info.as_mut() {
-                    info.set_make(DHU_MAKE.into());
-                    info.set_model(DHU_MODEL.into());
-                    info.set_head_unit_make(DHU_MAKE.into());
-                    info.set_head_unit_model(DHU_MODEL.into());
-                }
-                info!(
-                    "{} <yellow>{:?}</>: enabling developer mode",
-                    get_name(proxy_type),
-                    control.unwrap(),
-                );
-            }
-
-            if cfg.remove_bluetooth {
-                msg.services.retain(|svc| svc.bluetooth_service.is_none());
-            }
-
-            if cfg.remove_wifi {
-                msg.services
-                    .retain(|svc| svc.wifi_projection_service.is_none());
-            }
-
-            // EV routing features
-            if cfg.ev {
-                if let Some(svc) = msg
-                    .services
-                    .iter_mut()
-                    .find(|svc| !svc.sensor_source_service.sensors.is_empty())
-                {
-                    info!(
-                        "{} <yellow>{:?}</>: adding <b><green>EV</> features...",
-                        get_name(proxy_type),
-                        control.unwrap(),
-                    );
-
-                    // add VEHICLE_ENERGY_MODEL_DATA sensor
-                    let mut sensor = Sensor::new();
-                    sensor.set_sensor_type(SENSOR_VEHICLE_ENERGY_MODEL_DATA);
-                    svc.sensor_source_service
-                        .as_mut()
-                        .unwrap()
-                        .sensors
-                        .push(sensor);
-
-                    // set FUEL_TYPE
-                    svc.sensor_source_service
-                        .as_mut()
-                        .unwrap()
-                        .supported_fuel_types = vec![FuelType::FUEL_TYPE_ELECTRIC.into()];
-
-                    // supported connector types
-                    let connectors: Vec<EnumOrUnknown<EvConnectorType>> =
-                        match &cfg.ev_connector_types.0 {
-                            Some(types) => types.iter().map(|&t| t.into()).collect(),
-                            None => {
-                                vec![EvConnectorType::EV_CONNECTOR_TYPE_MENNEKES.into()]
-                            }
-                        };
-                    info!(
-                        "{} <yellow>{:?}</>: EV connectors: {:?}",
-                        get_name(proxy_type),
-                        control.unwrap(),
-                        connectors,
-                    );
-                    svc.sensor_source_service
-                        .as_mut()
-                        .unwrap()
-                        .supported_ev_connector_types = connectors;
-                }
-            }
-
-            let added_services = add_display_services(&mut msg, cfg);
-            if added_services > 0 {
-                let before_ids: HashSet<i32> = ctx.hu_service_ids.clone();
-                let after_ids: HashSet<i32> = msg.services.iter().map(|s| s.id()).collect();
-                for sid in after_ids.difference(&before_ids) {
-                    ctx.injected_service_ids.insert(*sid);
-                    if let Some(svc) = msg.services.iter().find(|s| s.id() == *sid) {
-                        if !svc.media_sink_service.video_configs.is_empty() {
-                            ctx.injected_media_display
-                                .insert(*sid as u8, svc.media_sink_service.display_type());
-                        }
-                    }
-                }
-                info!(
-                    "{} <yellow>{:?}</>: injected <b>{}</> display service(s)",
-                    get_name(proxy_type),
-                    control.unwrap(),
-                    added_services,
-                );
-                info!(
-                    "{} <blue>injected service ids:</> <b>{:?}</>",
-                    get_name(proxy_type),
-                    ctx.injected_service_ids
-                );
-            }
-
-            // Populate media_channels (channel_id→sink) from the offset→sink map.
-            // Do this after add_display_services so HU includes injected channels (e.g., cluster 0x08).
-            // Both proxy contexts use this for injected suppression/deferred focus evaluation.
-            debug!(
-                "{} SDR handling: media_sinks.len()={} media_channels.len()={}",
-                get_name(proxy_type),
-                ctx.media_sinks.len(),
-                ctx.media_channels.len()
-            );
-            ctx.media_service_labels.clear();
-            for svc in msg.services.iter() {
-                if let Some(label) = describe_media_service(svc) {
-                    ctx.media_service_labels.insert(svc.id() as u8, label);
-                }
-            }
-
-            if !ctx.media_sinks.is_empty() {
-                for svc in msg.services.iter() {
-                    let ch = svc.id() as u8;
-                    if !svc.media_sink_service.video_configs.is_empty() {
-                        let offset = svc.media_sink_service.display_type().value() as u8;
-                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
-                            sink.set_video_stream_info(
-                                svc.media_sink_service.available_type(),
-                                svc.media_sink_service.display_type(),
-                            )
-                            .await;
-                            ctx.media_channels.insert(ch, sink);
-                            debug!(
-                                "{} media_channels.insert: ch={:#04x} offset={}",
-                                get_name(proxy_type),
-                                ch,
-                                offset
-                            );
-                            info!(
-                                "{} <blue>media tap:</> video channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
-                                get_name(proxy_type),
-                                ch,
-                                offset,
-                                svc.media_sink_service.available_type(),
-                                svc.media_sink_service.display_type()
-                            );
-                        }
-                    } else if !svc.media_sink_service.audio_configs.is_empty()
-                        || svc.media_sink_service.audio_type.is_some()
-                    {
-                        // audio offset = audio_type value + 2 (offsets 0-2 reserved for video)
-                        let offset = svc.media_sink_service.audio_type().value() as u8 + 2;
-                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
-                            let audio_config = svc.media_sink_service.audio_configs.first().map(|acfg| {
-                                AudioStreamConfig {
-                                    sample_rate: acfg.sampling_rate(),
-                                    channels: acfg.number_of_channels(),
-                                    bits: acfg.number_of_bits(),
-                                }
-                            });
-                            sink.set_audio_stream_info(
-                                svc.media_sink_service.available_type(),
-                                svc.media_sink_service.audio_type(),
-                                audio_config,
-                            )
-                            .await;
-                            ctx.media_channels.insert(ch, sink);
-                            debug!(
-                                "{} media_channels.insert: ch={:#04x} offset={}",
-                                get_name(proxy_type),
-                                ch,
-                                offset
-                            );
-                            if let Some(acfg) = audio_config {
-                                info!(
-                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?}, {}Hz, {}ch, {}bit)",
-                                    get_name(proxy_type),
-                                    ch,
-                                    offset,
-                                    svc.media_sink_service.available_type(),
-                                    svc.media_sink_service.audio_type(),
-                                    acfg.sample_rate,
-                                    acfg.channels,
-                                    acfg.bits
-                                );
-                            } else {
-                                info!(
-                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
-                                    get_name(proxy_type),
-                                    ch,
-                                    offset,
-                                    svc.media_sink_service.available_type(),
-                                    svc.media_sink_service.audio_type()
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            apply_display_injection_and_refresh_media_maps(
+                proxy_type,
+                ctx,
+                cfg,
+                control.unwrap(),
+                &mut msg,
+            )
+            .await;
 
             if log_enabled!(log::Level::Info) {
                 info!(
@@ -2860,28 +2828,16 @@ pub async fn pkt_modify_hook(
                     );
                 }
 
-                if injected {
-                    ctx.injected_open_seen += 1;
-                    if proxy_type == ProxyType::HeadUnit && flow == PacketFlow::ToEndpoint {
-                        // Keep injected services hidden from HU: answer locally with success.
-                        ctx.injected_channels.insert(sid as u8);
-
-                        let mut response = ChannelOpenResponse::new();
-                        response.set_status(MessageStatus::STATUS_SUCCESS);
-                        let mut payload = response.write_to_bytes()?;
-                        payload.insert(0, ((MESSAGE_CHANNEL_OPEN_RESPONSE as u16) >> 8) as u8);
-                        payload.insert(1, ((MESSAGE_CHANNEL_OPEN_RESPONSE as u16) & 0xff) as u8);
-                        pkt.payload = payload;
-
-                        info!(
-                            "{} <yellow>transparency:</> synthesized CHANNEL_OPEN_RESPONSE for injected service_id <b>{}</>; HU path suppressed",
-                            get_name(proxy_type),
-                            sid
-                        );
-
-                        // handled=true => send this reply packet back to MD side only.
-                        return Ok(true);
-                    }
+                if injected
+                    && maybe_synthesize_injected_channel_open_response(
+                        proxy_type,
+                        flow,
+                        ctx,
+                        sid,
+                        pkt,
+                    )?
+                {
+                    return Ok(true);
                 }
             }
         }
@@ -3792,6 +3748,39 @@ mod tests {
         svc
     }
 
+    fn make_audio_service(id: i32, audio_type: AudioStreamType) -> Service {
+        let mut svc = Service::new();
+        svc.set_id(id);
+
+        let mut media = MediaSinkService::new();
+        media.set_available_type(MediaCodecType::MEDIA_CODEC_AUDIO_PCM);
+        media.set_audio_type(audio_type);
+
+        let mut audio_cfg = AudioConfiguration::new();
+        audio_cfg.set_sampling_rate(48000);
+        audio_cfg.set_number_of_channels(2);
+        audio_cfg.set_number_of_bits(16);
+        media.audio_configs.push(audio_cfg);
+
+        svc.media_sink_service = Some(media).into();
+        svc
+    }
+
+    fn make_sensor_service(id: i32, sensor_types: &[SensorType], location_characterization: u32) -> Service {
+        let mut svc = Service::new();
+        svc.set_id(id);
+
+        let mut sensor_service = SensorSourceService::new();
+        for sensor_type in sensor_types {
+            let mut sensor = Sensor::new();
+            sensor.set_sensor_type(*sensor_type);
+            sensor_service.sensors.push(sensor);
+        }
+        sensor_service.set_location_characterization(location_characterization);
+        svc.sensor_source_service = Some(sensor_service).into();
+        svc
+    }
+
     fn test_ctx() -> ModifyContext {
         let (ev_tx, _) = mpsc::channel(1);
         ModifyContext {
@@ -3892,7 +3881,7 @@ mod tests {
     }
 
     #[test]
-    fn add_display_services_adds_cluster_media_and_input_when_opted_in() {
+    fn add_display_services_adds_cluster_input_when_opted_in() {
         let mut cfg = AppConfig::default();
         cfg.mitm = true;
         cfg.inject_display_types = crate::config_types::InjectDisplayTypes(Some(vec![
@@ -3909,6 +3898,13 @@ mod tests {
         assert_eq!(added, 2);
         assert!(has_video_display(&msg, DisplayType::DISPLAY_TYPE_CLUSTER));
         assert!(has_input_display(&msg, cfg.inject_cluster_display_id.into()));
+
+        let cluster_input = msg
+            .services
+            .iter()
+            .find(|svc| svc.input_source_service.display_id() == u32::from(cfg.inject_cluster_display_id))
+            .unwrap();
+        assert!(cluster_input.input_source_service.touchscreen.is_empty());
     }
 
     #[test]
@@ -3985,6 +3981,219 @@ mod tests {
         assert_eq!(added, 1);
         assert!(has_video_display(&msg, DisplayType::DISPLAY_TYPE_CLUSTER));
         assert!(!has_input_display(&msg, cfg.inject_cluster_display_id.into()));
+    }
+
+    #[test]
+    fn sdr_capability_overrides_rewrite_media_sinks_and_identity() {
+        let mut cfg = AppConfig::default();
+        cfg.dpi = 200;
+        cfg.disable_tts_sink = true;
+        cfg.disable_media_sink = true;
+        cfg.developer_mode = true;
+
+        let mut msg = ServiceDiscoveryResponse::new();
+        msg.services
+            .push(make_video_service(1, DisplayType::DISPLAY_TYPE_MAIN, 0));
+        msg.services.push(make_audio_service(2, AUDIO_STREAM_GUIDANCE));
+        msg.services.push(make_audio_service(3, AUDIO_STREAM_MEDIA));
+        msg.set_make("OEM".into());
+        msg.set_model("Unit".into());
+        msg.set_head_unit_make("OEM".into());
+        msg.set_head_unit_model("Unit".into());
+
+        let mut info = HeadUnitInfo::new();
+        info.set_make("OEM".into());
+        info.set_model("Unit".into());
+        info.set_head_unit_make("OEM".into());
+        info.set_head_unit_model("Unit".into());
+        msg.headunit_info = Some(info).into();
+
+        apply_sdr_service_capability_overrides(
+            ProxyType::HeadUnit,
+            MESSAGE_SERVICE_DISCOVERY_RESPONSE,
+            &cfg,
+            &mut msg,
+        );
+
+        assert_eq!(msg.services.len(), 2);
+        assert_eq!(msg.services[0].media_sink_service.video_configs[0].density(), 200);
+        assert_eq!(msg.services[1].media_sink_service.audio_type(), AUDIO_STREAM_SYSTEM_AUDIO);
+        assert_eq!(msg.make(), DHU_MAKE);
+        assert_eq!(msg.model(), DHU_MODEL);
+        assert_eq!(msg.head_unit_make(), DHU_MAKE);
+        assert_eq!(msg.head_unit_model(), DHU_MODEL);
+        let info = msg.headunit_info.as_ref().unwrap();
+        assert_eq!(info.make(), DHU_MAKE);
+        assert_eq!(info.model(), DHU_MODEL);
+    }
+
+    #[test]
+    fn sdr_capability_overrides_strip_motion_and_add_ev_features() {
+        let mut cfg = AppConfig::default();
+        cfg.remove_tap_restriction = true;
+        cfg.video_in_motion = true;
+        cfg.ev = true;
+
+        let mut msg = ServiceDiscoveryResponse::new();
+        msg.services.push(make_sensor_service(
+            1,
+            &[
+                SENSOR_SPEED,
+                SENSOR_ACCELEROMETER_DATA,
+                SENSOR_GYROSCOPE_DATA,
+                SENSOR_LOCATION,
+            ],
+            999,
+        ));
+
+        apply_sdr_service_capability_overrides(
+            ProxyType::HeadUnit,
+            MESSAGE_SERVICE_DISCOVERY_RESPONSE,
+            &cfg,
+            &mut msg,
+        );
+
+        let sensor_service = msg.services[0].sensor_source_service.as_ref().unwrap();
+        let sensor_types: Vec<_> = sensor_service
+            .sensors
+            .iter()
+            .map(|sensor| sensor.sensor_type())
+            .collect();
+        assert!(!sensor_types.contains(&SENSOR_SPEED));
+        assert!(!sensor_types.contains(&SENSOR_ACCELEROMETER_DATA));
+        assert!(!sensor_types.contains(&SENSOR_GYROSCOPE_DATA));
+        assert!(sensor_types.contains(&SENSOR_LOCATION));
+        assert!(sensor_types.contains(&SENSOR_VEHICLE_ENERGY_MODEL_DATA));
+        assert_eq!(sensor_service.location_characterization(), 256);
+        assert_eq!(sensor_service.supported_fuel_types.len(), 1);
+        assert_eq!(sensor_service.supported_ev_connector_types.len(), 1);
+    }
+
+    #[test]
+    fn track_injected_display_services_marks_only_non_hu_services() {
+        let mut ctx = test_ctx();
+        ctx.hu_service_ids.extend([1, 4]);
+
+        let services = vec![
+            make_video_service(1, DisplayType::DISPLAY_TYPE_MAIN, 0),
+            make_video_service(2, DisplayType::DISPLAY_TYPE_CLUSTER, 1),
+            make_input_service(3, 1),
+            make_audio_service(4, AUDIO_STREAM_MEDIA),
+        ];
+
+        let newly_tracked = track_injected_display_services(&mut ctx, &services);
+
+        assert_eq!(newly_tracked, vec![2, 3]);
+        assert_eq!(ctx.injected_service_ids, HashSet::from([2, 3]));
+        assert_eq!(
+            ctx.injected_media_display.get(&2),
+            Some(&DisplayType::DISPLAY_TYPE_CLUSTER)
+        );
+        assert!(!ctx.injected_media_display.contains_key(&3));
+        assert!(!ctx.injected_service_ids.contains(&1));
+        assert!(!ctx.injected_service_ids.contains(&4));
+    }
+
+    #[test]
+    fn track_injected_display_services_is_idempotent_for_existing_entries() {
+        let mut ctx = test_ctx();
+        ctx.hu_service_ids.insert(1);
+        ctx.injected_service_ids.insert(2);
+        ctx.injected_media_display
+            .insert(2, DisplayType::DISPLAY_TYPE_CLUSTER);
+
+        let services = vec![
+            make_video_service(1, DisplayType::DISPLAY_TYPE_MAIN, 0),
+            make_video_service(2, DisplayType::DISPLAY_TYPE_CLUSTER, 1),
+        ];
+
+        let newly_tracked = track_injected_display_services(&mut ctx, &services);
+
+        assert!(newly_tracked.is_empty());
+        assert_eq!(ctx.injected_service_ids, HashSet::from([2]));
+        assert_eq!(
+            ctx.injected_media_display.get(&2),
+            Some(&DisplayType::DISPLAY_TYPE_CLUSTER)
+        );
+    }
+
+    #[test]
+    fn injected_channel_open_request_is_answered_locally_on_hu_path() {
+        let mut ctx = test_ctx();
+        ctx.injected_service_ids.insert(0x2A);
+
+        let mut request = ChannelOpenRequest::new();
+        request.set_service_id(0x2A);
+        request.set_priority(0);
+        let mut payload = request.write_to_bytes().unwrap();
+        payload.insert(0, ((MESSAGE_CHANNEL_OPEN_REQUEST as u16) >> 8) as u8);
+        payload.insert(1, ((MESSAGE_CHANNEL_OPEN_REQUEST as u16) & 0xff) as u8);
+        let mut pkt = test_packet(0x00, FRAME_TYPE_FIRST | FRAME_TYPE_LAST, None, &payload);
+
+        let handled = maybe_synthesize_injected_channel_open_response(
+            ProxyType::HeadUnit,
+            PacketFlow::ToEndpoint,
+            &mut ctx,
+            0x2A,
+            &mut pkt,
+        )
+        .unwrap();
+
+        assert!(handled);
+        assert_eq!(ctx.injected_open_seen, 1);
+        assert!(ctx.injected_channels.contains(&0x2A));
+        let msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]) as i32;
+        assert_eq!(msg_id, MESSAGE_CHANNEL_OPEN_RESPONSE.value());
+        let response = ChannelOpenResponse::parse_from_bytes(&pkt.payload[2..]).unwrap();
+        assert_eq!(response.status(), MessageStatus::STATUS_SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn register_media_channels_sets_sink_metadata_for_display_and_audio_services() {
+        let mut ctx = test_ctx();
+        let video_sink = MediaSink::new(4);
+        let audio_sink = MediaSink::new(4);
+        ctx.media_sinks.insert(1, video_sink.clone());
+        ctx.media_sinks.insert(5, audio_sink.clone());
+
+        let services = vec![
+            make_video_service(0x08, DisplayType::DISPLAY_TYPE_CLUSTER, 1),
+            make_audio_service(0x0B, AUDIO_STREAM_MEDIA),
+        ];
+
+        refresh_media_service_labels(&mut ctx, &services);
+        register_media_channels_from_services(
+            ProxyType::HeadUnit,
+            &mut ctx,
+            &services,
+            true,
+        )
+        .await;
+
+        assert!(ctx.media_channels.contains_key(&0x08));
+        assert!(ctx.media_channels.contains_key(&0x0B));
+        assert!(matches!(
+            video_sink.get_stream_info().await,
+            Some(MediaStreamInfo {
+                kind: MediaStreamKind::Video {
+                    codec: MediaCodecType::MEDIA_CODEC_VIDEO_H264_BP,
+                    display_type: DisplayType::DISPLAY_TYPE_CLUSTER,
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            audio_sink.get_stream_info().await,
+            Some(MediaStreamInfo {
+                kind: MediaStreamKind::Audio {
+                    codec: MediaCodecType::MEDIA_CODEC_AUDIO_PCM,
+                    audio_type: AUDIO_STREAM_MEDIA,
+                },
+                ..
+            })
+        ));
+        assert!(ctx.media_service_labels.contains_key(&0x08));
+        assert!(ctx.media_service_labels.contains_key(&0x0B));
     }
 
     #[test]
@@ -4178,6 +4387,25 @@ mod tests {
             .get(&0x2A)
             .is_some_and(|state| state.phase == InjectedMediaPhase::SetupSeen));
         assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tap_connect_without_injected_runtime_state_does_not_emit_focus() {
+        let mut ctx = test_ctx();
+        ctx.injected_media_display
+            .insert(0x2A, DisplayType::DISPLAY_TYPE_CLUSTER);
+
+        let sink = MediaSink::new(4);
+        sink.note_client_connected();
+        let _subscription = sink.subscribe();
+        ctx.media_channels.insert(0x2A, sink);
+
+        let (tx, mut rx) = mpsc::channel(4);
+
+        maybe_emit_pending_injected_focus(ProxyType::HeadUnit, &mut ctx, &AppConfig::default(), &tx)
+            .unwrap();
+
         assert!(rx.try_recv().is_err());
     }
 
