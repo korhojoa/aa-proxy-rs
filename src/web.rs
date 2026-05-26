@@ -151,6 +151,7 @@ pub struct AppState {
     pub last_tire_pressure_data: Arc<RwLock<Option<TirePressureData>>>,
     pub ws_event_tx: broadcast::Sender<ServerEvent>,
     pub script_registry: Option<Arc<ScriptRegistry>>,
+    pub last_exlap_data: crate::exlap::SharedExlapData,
 }
 
 pub fn app(state: Arc<AppState>) -> Router {
@@ -245,6 +246,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         )
         .route("/disconnect", post(disconnect_handler))
         .route("/aa-proxy-rs.webp", get(logo_handler))
+        .route("/exlap/urls", get(exlap_urls_handler))
+        .route("/exlap/data", get(exlap_data_handler))
+        .route("/exlap/subscribe/:url", post(exlap_subscribe_handler).delete(exlap_unsubscribe_handler))
         .with_state(state)
 }
 
@@ -2385,4 +2389,141 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
+}
+
+// ── ExLAP web handlers ────────────────────────────────────────────────────────
+
+async fn exlap_urls_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let shared = state.last_exlap_data.read().await;
+    Json(json!({
+        "connection_state": shared.connection_state,
+        "subscription_limit_reached": shared.subscription_limit_reached,
+        "urls": shared.urls,
+    }))
+    .into_response()
+}
+
+async fn exlap_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let shared = state.last_exlap_data.read().await;
+    Json(json!({
+        "connection_state": shared.connection_state,
+        "subscription_limit_reached": shared.subscription_limit_reached,
+        "values": shared.values,
+    }))
+    .into_response()
+}
+
+async fn exlap_subscribe_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(url): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let (channel, session_id, next_req_id) = {
+        let shared = state.last_exlap_data.read().await;
+        match &shared.session {
+            Some(s) => (s.channel, s.session_id.clone(), s.next_req_id.clone()),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"status": "error", "message": "ExLAP session not active"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let Some(tx) = state.tx.lock().await.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "error", "message": "No active session tx"})),
+        )
+            .into_response();
+    };
+
+    use crate::mitm::{Packet, ENCRYPTED, FRAME_TYPE_FIRST, FRAME_TYPE_LAST};
+    use std::sync::atomic::Ordering;
+
+    let req_id = next_req_id.fetch_add(1, Ordering::Relaxed);
+    let xml = format!(
+        r#"<ExlapStatement session_id="{sid}"><Req id="{id}"><Subscribe url="{url}" timeStamp="true"/></Req></ExlapStatement>"#,
+        sid = session_id,
+        id = req_id,
+        url = url,
+    );
+    let pkt = Packet {
+        channel,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload: xml.into_bytes(),
+    };
+
+    if let Err(e) = tx.send(pkt).await {
+        error!("{} exlap subscribe send failed: {}", NAME, e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    info!("{} ExLAP subscribed to {}", NAME, url);
+    Json(json!({"status": "ok", "url": url})).into_response()
+}
+
+async fn exlap_unsubscribe_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(url): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let (channel, session_id, next_req_id) = {
+        let shared = state.last_exlap_data.read().await;
+        match &shared.session {
+            Some(s) => (s.channel, s.session_id.clone(), s.next_req_id.clone()),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"status": "error", "message": "ExLAP session not active"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let Some(tx) = state.tx.lock().await.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "error", "message": "No active session tx"})),
+        )
+            .into_response();
+    };
+
+    use crate::mitm::{Packet, ENCRYPTED, FRAME_TYPE_FIRST, FRAME_TYPE_LAST};
+    use std::sync::atomic::Ordering;
+
+    let req_id = next_req_id.fetch_add(1, Ordering::Relaxed);
+    let xml = format!(
+        r#"<ExlapStatement session_id="{sid}"><Req id="{id}"><Unsubscribe url="{url}"/></Req></ExlapStatement>"#,
+        sid = session_id,
+        id = req_id,
+        url = url,
+    );
+    let pkt = Packet {
+        channel,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload: xml.into_bytes(),
+    };
+
+    if let Err(e) = tx.send(pkt).await {
+        error!("{} exlap unsubscribe send failed: {}", NAME, e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    // Remove cached value for this URL on unsubscribe
+    state.last_exlap_data.write().await.values.remove(&url);
+
+    info!("{} ExLAP unsubscribed from {}", NAME, url);
+    Json(json!({"status": "ok", "url": url})).into_response()
 }

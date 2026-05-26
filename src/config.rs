@@ -621,6 +621,15 @@ pub struct AppConfig {
     /// Epoch deadline used for lifecycle/config/websocket calls. Epochs are incremented every 10 ms.
     pub wasm_script_lifecycle_epoch_deadline: u64,
 
+    /// Enable the independent ExLAP car-data client.
+    ///
+    /// When enabled with `mitm = true`, aa-proxy-rs opens its own ExLAP vendor-channel
+    /// session to the head unit and reads car sensor data (EV battery level,
+    /// outside temperature, …) independently of any phone app or HU changes.
+    /// The data is automatically injected as Android Auto EV energy-model sensor
+    /// packets so Google Maps EV routing gets real battery state.
+    pub exlap: bool,
+
     #[serde(skip)]
     pub action_requested: Option<Action>,
 
@@ -867,6 +876,7 @@ impl Default for AppConfig {
             wasm_script_table_elements_limit: 512,
             wasm_script_packet_epoch_deadline: 100,
             wasm_script_lifecycle_epoch_deadline: 1000,
+            exlap: false,
             runtime_mitm_failed: false,
         }
     }

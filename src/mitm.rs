@@ -200,6 +200,10 @@ pub struct ModifyContext {
     pub(crate) vendor_topic_event_bridges: HashMap<u8, VecTopicEventBridge>,
     /// Channel id -> semantic service kind map used only by pkt_debug filtering.
     pub(crate) debug_channel_kinds: HashMap<u8, PacketDebugServiceKind>,
+    /// ExLAP client state for our own HU ExLAP session (vendor channel approach).
+    pub(crate) exlap_client: Option<crate::exlap::ExlapClient>,
+    /// Vehicle fingerprint derived from the SDR; used to look up and persist ExLAP credentials.
+    pub(crate) vehicle_id: Option<String>,
 }
 
 fn service_audio_config(svc: &Service) -> Option<AudioStreamConfig> {
@@ -1051,6 +1055,7 @@ pub async fn pkt_modify_hook(
     config: &mut SharedConfig,
     script_registry: Option<Arc<ScriptRegistry>>,
     ws_event_tx: BroadcastSender<ServerEvent>,
+    shared_exlap: crate::exlap::SharedExlapData,
 ) -> Result<PacketAction> {
     // if for some reason we have too small packet, bail out
     if pkt.payload.len() < 2 {
@@ -1518,6 +1523,42 @@ pub async fn pkt_modify_hook(
     let control = protos::ControlMessageType::from_i32(message_id);
 
     if pkt.channel != 0 {
+        // ExLAP vendor channel — intercept all packets on our session channel.
+        // Must be checked before the VEC vendor handler and the forward guard.
+        if cfg.exlap && proxy_type == ProxyType::MobileDevice {
+            let is_our_channel = ctx.exlap_client.as_ref().map(|c| c.channel) == Some(pkt.channel);
+            if is_our_channel {
+                let hu_tx = ctx.hu_tx.clone();
+                let sensor_ch = ctx.sensor_channel;
+                let client = ctx.exlap_client.as_mut().unwrap();
+                let action = crate::exlap::handle_exlap_packet(
+                    pkt, client, &hu_tx, sensor_ch, last_battery,
+                    shared_exlap.clone(), &ws_event_tx,
+                )
+                .await?;
+                // If auth just succeeded, persist the working credential to the vehicle profile.
+                if let Some(cred_idx) = ctx.exlap_client.as_mut().unwrap().working_cred.take() {
+                    if let Some(ref vid) = ctx.vehicle_id {
+                        let path = cfg.sdr_ui_override_file.clone();
+                        let vid = vid.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::sdr_ui::save_exlap_credential(&path, &vid, cred_idx).await
+                            {
+                                warn!(" exlap: failed to save credential: {}", e);
+                            } else {
+                                info!(
+                                    " exlap: saved working credential index {} for vehicle {}",
+                                    cred_idx, vid
+                                );
+                            }
+                        });
+                    }
+                }
+                return Ok(action);
+            }
+        }
+
         // Non-zero channel AAP lifecycle/control frame.
         // Keep this separate from our custom vendor app-data parser.
         // The custom parser below does not inspect CONTROL flags or AAP control message ids.
@@ -1732,6 +1773,11 @@ pub async fn pkt_modify_hook(
                 Ok(msg) => msg,
             };
 
+            // Derive vehicle fingerprint for per-vehicle features (e.g. ExLAP credential).
+            ctx.vehicle_id = Some(crate::sdr_ui::vehicle_fingerprint(
+                &crate::sdr_ui::vehicle_info_from_sdr(&msg),
+            ));
+
             // Keep a semantic channel map for pkt_debug filters. This is updated
             // again after SDR rewriting/injected services below.
             update_debug_channel_kinds(ctx, &msg);
@@ -1843,6 +1889,59 @@ pub async fn pkt_modify_hook(
 
             // SDR rewriting is HeadUnit-only; MobileDevice sees SDR read-only (for channel map above)
             if proxy_type == ProxyType::MobileDevice {
+                // Open our own ExLAP session if enabled and the HU advertises the service.
+                if cfg.exlap && ctx.exlap_client.is_none() {
+                    if let Some(svc) = msg.services.iter().find(|svc| {
+                        svc.vendor_extension_service
+                            .as_ref()
+                            .map(|ves| {
+                                ves.service_name() == crate::exlap::EXLAP_VENDOR_CHANNEL_NAME
+                            })
+                            .unwrap_or(false)
+                    }) {
+                        let service_id = svc.id() as u8;
+                        let exlap_channel: u8 = 0x7E;
+                        // Use saved credential as first-try hint; fall back to index 0.
+                        let start_cred = if let Some(ref vid) = ctx.vehicle_id {
+                            crate::sdr_ui::get_exlap_credential(
+                                &cfg.sdr_ui_override_file,
+                                vid,
+                            )
+                            .await
+                            .unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        ctx.exlap_client =
+                            Some(crate::exlap::ExlapClient::new(exlap_channel, start_cred));
+                        let mut req = ChannelOpenRequest::new();
+                        req.set_service_id(service_id as i32);
+                        req.set_priority(0);
+                        if let Ok(payload) = req.write_to_bytes() {
+                            let open_pkt = build_control_reply_on_channel(
+                                exlap_channel,
+                                MESSAGE_CHANNEL_OPEN_REQUEST,
+                                payload,
+                            );
+                            if let Some(tx) = ctx.hu_tx.clone() {
+                                if let Err(e) = tx.send(open_pkt).await {
+                                    error!(
+                                        "{} ExLAP CHANNEL_OPEN_REQUEST send failed: {}",
+                                        get_name(proxy_type),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        info!(
+                            "{} ExLAP service found (service_id={:#04x}); sent CHANNEL_OPEN_REQUEST on channel {:#04x} (start_cred={})",
+                            get_name(proxy_type),
+                            service_id,
+                            exlap_channel,
+                            start_cred,
+                        );
+                    }
+                }
                 return Ok(PacketAction::Forward);
             }
 
@@ -2778,7 +2877,7 @@ fn build_control_reply(message_id: ControlMessageType, payload: Vec<u8>) -> Pack
     }
 }
 
-fn build_control_reply_on_channel(
+pub(crate) fn build_control_reply_on_channel(
     channel: u8,
     message_id: ControlMessageType,
     payload: Vec<u8>,
@@ -2819,6 +2918,7 @@ pub async fn proxy<D: IoDeviceTrait>(
     shared_media_channels: SharedMediaChannels,
     media_tap_endpoints: SharedMediaTapEndpoints,
     ws_event_tx: BroadcastSender<ServerEvent>,
+    shared_exlap: crate::exlap::SharedExlapData,
 ) -> Result<()> {
     let cfg = config.read().await.clone();
     let passthrough = !cfg.mitm || cfg.runtime_mitm_failed;
@@ -3059,6 +3159,8 @@ pub async fn proxy<D: IoDeviceTrait>(
         vendor_channel_states: HashMap::new(),
         vendor_topic_event_bridges: HashMap::new(),
         debug_channel_kinds: HashMap::from([(0, PacketDebugServiceKind::Control)]),
+        exlap_client: None,
+        vehicle_id: None,
     };
     let mut focus_poll = tokio::time::interval(Duration::from_millis(100));
     focus_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3168,7 +3270,8 @@ pub async fn proxy<D: IoDeviceTrait>(
                 &cfg,
                 &mut config,
                 script_registry.clone(),
-                ws_event_tx.clone()
+                ws_event_tx.clone(),
+                shared_exlap.clone(),
             )
             .await?;
             let _ = pkt_debug(
@@ -3262,6 +3365,7 @@ pub async fn proxy<D: IoDeviceTrait>(
                         &mut config,
                         script_registry.clone(),
                         ws_event_tx.clone(),
+                        shared_exlap.clone(),
                     )
                     .await?;
                     let _ = pkt_debug(
@@ -3364,6 +3468,8 @@ mod tests {
             vendor_channel_states: HashMap::new(),
             vendor_topic_event_bridges: HashMap::new(),
             debug_channel_kinds: HashMap::from([(0, PacketDebugServiceKind::Control)]),
+            exlap_client: None,
+            vehicle_id: None,
         }
     }
 

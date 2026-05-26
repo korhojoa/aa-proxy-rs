@@ -18,6 +18,7 @@ use aa_proxy_rs::mitm::SharedCompanionIp;
 use aa_proxy_rs::mitm::SharedMediaTapEndpoints;
 use aa_proxy_rs::mitm::SharedServiceDiscoveryResponse;
 use aa_proxy_rs::mitm::TirePressureData;
+use aa_proxy_rs::exlap::SharedExlapData;
 use aa_proxy_rs::proxy::io_loop;
 use aa_proxy_rs::run_io_loop;
 #[cfg(feature = "wasm-scripting")]
@@ -264,6 +265,7 @@ async fn tokio_main(
     usb_connected: Arc<AtomicBool>,
     ws_event_tx: broadcast::Sender<ServerEvent>,
     script_registry: Option<Arc<ScriptRegistry>>,
+    shared_exlap: SharedExlapData,
 ) -> Result<()> {
     let accessory_started = Arc::new(Notify::new());
     let accessory_started_cloned = accessory_started.clone();
@@ -283,6 +285,7 @@ async fn tokio_main(
         last_tire_pressure_data,
         ws_event_tx,
         script_registry,
+        last_exlap_data: shared_exlap,
     };
 
     // Handle process-exit signals with a protocol-clean teardown.
@@ -807,6 +810,8 @@ fn main() -> Result<()> {
     let usb_connected_cloned = usb_connected.clone();
     let (ws_event_tx, _ws_event_rx) = broadcast::channel(256);
     let ws_event_tx_cloned = ws_event_tx.clone();
+    let shared_exlap: SharedExlapData = Arc::new(RwLock::new(Default::default()));
+    let shared_exlap_cloned = shared_exlap.clone();
 
     // build and spawn main tokio runtime
     let mut runtime = Builder::new_multi_thread().enable_all().build().unwrap();
@@ -856,6 +861,7 @@ fn main() -> Result<()> {
             usb_connected_cloned,
             ws_event_tx_cloned,
             script_registry_cloned,
+            shared_exlap_cloned,
         )
         .await
     });
@@ -878,6 +884,7 @@ fn main() -> Result<()> {
             usb_connected,
             script_registry.clone(),
             ws_event_tx.clone(),
+            shared_exlap,
         )
     );
 

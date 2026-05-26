@@ -13,6 +13,7 @@ pub mod crash;
 pub mod device_info;
 pub mod display;
 pub mod ev;
+pub mod exlap;
 pub mod hu_input;
 pub mod inject_displays;
 pub mod io_backend;

@@ -258,6 +258,49 @@
         />
         <div class="config-grid">{CONFIG_VALUES}</div>
       </form>
+
+      <!-- ExLAP live data section -->
+      <section id="exlap-section" style="margin: 1.5rem 1rem;">
+        <div class="config-card-wrapper">
+          <div class="card-glass-bg"></div>
+          <details class="config-card" open>
+            <summary class="card-header">
+              <span class="card-header-title"><span>📡</span> <span>ExLAP Car Data</span></span>
+            </summary>
+            <div class="card-content">
+              <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:0.75rem;">
+                <span>Status: <strong id="exlap-status">–</strong></span>
+                <button type="button" onclick="exlapLoadUrls()" style="padding:0.25rem 0.75rem;">Refresh URL list</button>
+              </div>
+              <div id="exlap-limit-warn" style="display:none;color:#ef4444;margin-bottom:0.5rem;">
+                ⚠️ Subscription limit reached — unsubscribe some URLs before adding more.
+              </div>
+
+              <details style="margin-bottom:1rem;">
+                <summary style="cursor:pointer;">Available URLs (<span id="exlap-url-count">0</span>)</summary>
+                <div id="exlap-url-list" style="max-height:260px;overflow-y:auto;margin-top:0.5rem;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:0.25rem 0.75rem;">
+                  <em style="color:#6b7280">Load URL list first.</em>
+                </div>
+              </details>
+
+              <table id="exlap-values-table" style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+                <thead>
+                  <tr style="border-bottom:1px solid #374151;">
+                    <th style="text-align:left;padding:0.3rem 0.5rem;">URL</th>
+                    <th style="text-align:left;padding:0.3rem 0.5rem;">Value</th>
+                    <th style="text-align:left;padding:0.3rem 0.5rem;">Type</th>
+                    <th style="text-align:left;padding:0.3rem 0.5rem;">State</th>
+                    <th style="text-align:left;padding:0.3rem 0.5rem;"></th>
+                  </tr>
+                </thead>
+                <tbody id="exlap-values-body">
+                  <tr><td colspan="5" style="color:#6b7280;padding:0.5rem;">No data yet — subscribe to URLs above.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      </section>
     </main>
     <script>
       document.addEventListener("DOMContentLoaded", () => {
@@ -659,6 +702,169 @@
             if (card) card.open = met;
           });
       }
+
+      // ── ExLAP ────────────────────────────────────────────────────────────────
+
+      let exlapWs = null;
+      const exlapSubscribed = new Set();
+
+      function exlapWsConnect() {
+        if (exlapWs && exlapWs.readyState <= 1) return;
+        const wsUrl =
+          (location.protocol === "https:" ? "wss://" : "ws://") +
+          location.host +
+          "/ws";
+        exlapWs = new WebSocket(wsUrl);
+        exlapWs.addEventListener("message", (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "event" && msg.topic === "exlap") {
+              const updates = JSON.parse(msg.payload);
+              exlapApplyUpdates(updates);
+            }
+          } catch (_) {}
+        });
+        exlapWs.addEventListener("open", () => {
+          exlapWs.send(JSON.stringify({ type: "subscribe", topic: "exlap" }));
+        });
+        exlapWs.addEventListener("close", () => {
+          setTimeout(exlapWsConnect, 3000);
+        });
+      }
+
+      function exlapApplyUpdates(updates) {
+        const tbody = document.getElementById("exlap-values-body");
+        for (const entry of updates) {
+          let row = document.getElementById(
+            "exlap-row-" + CSS.escape(entry.url),
+          );
+          if (!row) {
+            row = document.createElement("tr");
+            row.id = "exlap-row-" + CSS.escape(entry.url);
+            row.innerHTML = `
+              <td style="padding:0.25rem 0.5rem;font-family:monospace;">${escHtml(entry.url)}</td>
+              <td class="exlap-val" style="padding:0.25rem 0.5rem;"></td>
+              <td style="padding:0.25rem 0.5rem;color:#9ca3af;">${escHtml(entry.type || "")}</td>
+              <td class="exlap-state" style="padding:0.25rem 0.5rem;"></td>
+              <td style="padding:0.25rem 0.5rem;">
+                <button type="button" onclick="exlapUnsub(${JSON.stringify(entry.url)})"
+                  style="font-size:0.75rem;padding:0.1rem 0.4rem;color:#ef4444;">✕</button>
+              </td>`;
+            const placeholder = tbody.querySelector("td[colspan]");
+            if (placeholder) placeholder.parentElement.remove();
+            tbody.appendChild(row);
+          }
+          row.querySelector(".exlap-val").textContent = entry.val ?? "";
+          const stateEl = row.querySelector(".exlap-state");
+          stateEl.textContent = entry.state ?? "";
+          stateEl.style.color =
+            entry.state === "ok" || !entry.state ? "#6b7280" : "#ef4444";
+        }
+      }
+
+      async function exlapLoadUrls() {
+        const res = await fetch("/exlap/urls");
+        const data = await res.json();
+
+        document.getElementById("exlap-status").textContent =
+          data.connection_state ?? "–";
+        const limitWarn = document.getElementById("exlap-limit-warn");
+        limitWarn.style.display = data.subscription_limit_reached
+          ? "block"
+          : "none";
+
+        const urls = data.urls ?? [];
+        document.getElementById("exlap-url-count").textContent = urls.length;
+        const container = document.getElementById("exlap-url-list");
+        container.innerHTML = "";
+        for (const entry of urls) {
+          if (entry.url_type === "function") continue;
+          const label = document.createElement("label");
+          label.style.cssText =
+            "display:flex;align-items:center;gap:0.35rem;cursor:pointer;";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = exlapSubscribed.has(entry.url);
+          cb.addEventListener("change", () => {
+            if (cb.checked) exlapSub(entry.url);
+            else exlapUnsub(entry.url);
+          });
+          label.appendChild(cb);
+          label.appendChild(document.createTextNode(entry.url));
+          container.appendChild(label);
+        }
+
+        const dataRes = await fetch("/exlap/data");
+        if (dataRes.ok) {
+          const d = await dataRes.json();
+          const entries = Object.entries(d.values ?? {}).map(([url, v]) => ({
+            url,
+            ...v,
+          }));
+          if (entries.length) exlapApplyUpdates(entries);
+        }
+      }
+
+      async function exlapSub(url) {
+        const res = await fetch(
+          "/exlap/subscribe/" + encodeURIComponent(url),
+          { method: "POST" },
+        );
+        if (res.ok) {
+          exlapSubscribed.add(url);
+        } else {
+          const t = await res.text();
+          alert("Subscribe failed: " + t);
+        }
+      }
+
+      async function exlapUnsub(url) {
+        const res = await fetch(
+          "/exlap/subscribe/" + encodeURIComponent(url),
+          { method: "DELETE" },
+        );
+        if (res.ok) {
+          exlapSubscribed.delete(url);
+          const row = document.getElementById(
+            "exlap-row-" + CSS.escape(url),
+          );
+          if (row) row.remove();
+          const tbody = document.getElementById("exlap-values-body");
+          if (!tbody.children.length) {
+            tbody.innerHTML =
+              '<tr><td colspan="5" style="color:#6b7280;padding:0.5rem;">No data yet — subscribe to URLs above.</td></tr>';
+          }
+        } else {
+          const t = await res.text();
+          alert("Unsubscribe failed: " + t);
+        }
+      }
+
+      function escHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        exlapWsConnect();
+        fetch("/exlap/urls")
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => {
+            if (!data) return;
+            document.getElementById("exlap-status").textContent =
+              data.connection_state ?? "–";
+            document.getElementById("exlap-limit-warn").style.display =
+              data.subscription_limit_reached ? "block" : "none";
+            document.getElementById("exlap-url-count").textContent = (
+              data.urls ?? []
+            ).length;
+          })
+          .catch(() => {});
+      });
+
+      // ── end ExLAP ────────────────────────────────────────────────────────────
 
       // ----- Multi-select chip widget: progressively enhances any
       // `<select multiple>` into a chip-based dropdown. Activated once at

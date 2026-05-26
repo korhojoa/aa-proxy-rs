@@ -75,6 +75,10 @@ pub struct SdrUiVehicleProfile {
     pub displays: Vec<SdrUiDisplayProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phones: Vec<SdrUiPhoneProfile>,
+    /// Index into the ExLAP credential table that authenticated successfully for this vehicle.
+    /// Absent until a session succeeds; used as the first-try hint on reconnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exlap_credential: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -354,6 +358,33 @@ pub async fn delete_vehicle_profile(path: PathBuf, vehicle_id: &str) -> Result<b
     Ok(deleted)
 }
 
+/// Return the saved ExLAP credential index for this vehicle, if any.
+pub(crate) async fn get_exlap_credential(path: &Path, vehicle_id: &str) -> Option<usize> {
+    read_profiles_file(path)
+        .await
+        .ok()
+        .and_then(|p| p.vehicles.into_iter().find(|v| v.id == vehicle_id))
+        .and_then(|v| v.exlap_credential)
+        .map(|c| c as usize)
+}
+
+/// Persist a working ExLAP credential index for this vehicle.
+/// No-op if the vehicle profile does not exist yet.
+pub(crate) async fn save_exlap_credential(
+    path: &Path,
+    vehicle_id: &str,
+    cred_idx: usize,
+) -> Result<()> {
+    let mut profiles = read_profiles_file(path).await?;
+    if let Some(v) = profiles.vehicles.iter_mut().find(|v| v.id == vehicle_id) {
+        if v.exlap_credential != Some(cred_idx as u8) {
+            v.exlap_credential = Some(cred_idx as u8);
+            write_profiles_file(path, &profiles).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn process_service_discovery_response(
     msg: &mut ServiceDiscoveryResponse,
     cfg: &AppConfig,
@@ -488,6 +519,7 @@ fn ensure_vehicle_profile(
         info: vehicle_info.clone(),
         displays: snapshot.to_vec(),
         phones: Vec::new(),
+        exlap_credential: None,
     });
     true
 }
@@ -881,7 +913,7 @@ fn insets_from_proto(insets: &Insets) -> SdrUiInsets {
     }
 }
 
-fn vehicle_info_from_sdr(msg: &ServiceDiscoveryResponse) -> SdrUiVehicleInfo {
+pub(crate) fn vehicle_info_from_sdr(msg: &ServiceDiscoveryResponse) -> SdrUiVehicleInfo {
     let hu = &msg.headunit_info;
     let vehicle_id = first_non_empty(&[hu.vehicle_id(), msg.vehicle_id()]);
 
@@ -918,7 +950,7 @@ fn non_empty_string(value: &str) -> Option<String> {
     }
 }
 
-fn vehicle_fingerprint(info: &SdrUiVehicleInfo) -> String {
+pub(crate) fn vehicle_fingerprint(info: &SdrUiVehicleInfo) -> String {
     let raw = [
         info.make.as_deref().unwrap_or(""),
         info.model.as_deref().unwrap_or(""),

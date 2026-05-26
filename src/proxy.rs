@@ -558,6 +558,7 @@ pub async fn io_loop(
     usb_connected: Arc<AtomicBool>,
     script_registry: Option<Arc<ScriptRegistry>>,
     ws_event_tx: BroadcastSender<ServerEvent>,
+    shared_exlap: crate::exlap::SharedExlapData,
 ) -> Result<()> {
     let shared_config = config.clone();
     #[allow(unused_variables)]
@@ -924,6 +925,7 @@ pub async fn io_loop(
             persistent_media_channels.clone(),
             media_tap_endpoints.clone(),
             ws_event_tx.clone(),
+            shared_exlap.clone(),
         ));
         from_stream = spawn!(proxy(
             ProxyType::MobileDevice,
@@ -945,6 +947,7 @@ pub async fn io_loop(
             persistent_media_channels.clone(),
             media_tap_endpoints.clone(),
             ws_event_tx.clone(),
+            shared_exlap.clone(),
         ));
 
         // Thread for monitoring transfer
